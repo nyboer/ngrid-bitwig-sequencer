@@ -10,11 +10,14 @@ import com.bitwig.extension.controller.api.MidiIn;
 import com.bitwig.extension.controller.api.MidiOut;
 import com.bitwig.extension.controller.api.NoteStep;
 import com.bitwig.extension.controller.api.PinnableCursorClip;
+import com.bitwig.extension.controller.api.Transport;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -26,8 +29,8 @@ import java.util.Set;
  *   rows 6 and 5   - step toggles, 16 steps total (row 6 = steps 0-7, row 5 = steps 8-15)
  *   row 4          - one-octave keyboard, black keys (also octave shift at columns 0 and 7)
  *   row 3          - one-octave keyboard, white keys
- *   rows 2, 1, 0    - modifier rows for the held step; what they edit depends on the current
- *                     Modifier Column mode (see below)
+ *   rows 2, 1, 0    - modifier rows for the held step (or the whole clip - see below); what
+ *                     they edit depends on the current Modifier Column mode (see below)
  *
  * The 9th column past the edge of the 8x8 grid ("Modifier Column", CC 19-89, +10 per row -
  * see LpProtocol) is a set of radio buttons that pick what rows 2-0 do. Only the bottom three
@@ -35,8 +38,11 @@ import java.util.Set;
  *   - Note Ops (row 2 button, CC39, the default mode): row 2 = recurrence pattern (8 cycles),
  *     row 1 = chance as a 0-8 bar in 12.5% increments, row 0 = note length in 1/16 increments
  *     up to 8/16.
- *   - Note Expressions (row 1 button, CC29): row 2 = timbre (-100..100, bipolar - see
- *     onTimbrePad), row 1 = pressure as a 0-8 bar in 12.5% increments, row 0 = velocity, same.
+ *   - Note Expressions (row 1 button, CC29): row 2 = timbre, -100..100 and bipolar - each
+ *     column alone sets one of 8 values skipping zero (-100,-75,-50,-25,25,50,75,100), and two
+ *     adjacent held columns set the midpoint of theirs, e.g. columns 3+4 land on the skipped 0
+ *     (see timbreSingleValue). Row 1 = pressure as a 0-8 bar in 12.5% increments, row 0 =
+ *     velocity, same.
  *   - The row 0 button (CC19) is reserved; selecting it leaves rows 2-0 blank.
  * Whichever mode is active lights its Modifier Column button white; the other two are off.
  *
@@ -51,10 +57,16 @@ import java.util.Set;
  * rather than to tap it on/off. This is what makes it possible to hold an already-on step
  * just to inspect or edit its modifiers without also toggling it off.
  *
- * Rows 2-0 reflect and edit the note(s) on whichever step is currently held down (rows 6/5);
- * if a step holds more than one note, they show/edit the lowest-pitched one, and edits apply
- * to every note in that step. These rows are blank when no step is held or the held step is
- * empty - there's nothing to show or edit until a note exists.
+ * Rows 2-0 normally reflect and edit the note(s) on whichever step is currently held down
+ * (rows 6/5): if a step holds more than one note, they show/edit the lowest-pitched one, and
+ * edits apply to every note in that step. They're blank when no step is held or the held step
+ * is empty - there's nothing to show or edit until a note exists.
+ *
+ * Holding a clip pad (row 7) instead of a step - with no step held - switches rows 2-0 to
+ * whole-clip mode: they show default values (recurrence off, 100% chance, 1/16 length, 0
+ * timbre, etc. - see the displayedXxx methods) rather than any particular note's, and any edit
+ * applies to every note in the whole clip, not just one step's. A held step always takes
+ * priority over a held clip pad if both happen to be held at once.
  */
 public class LaunchpadSeqExtension extends ControllerExtension {
 
@@ -90,6 +102,18 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     private static final int MODIFIER_LEVELS = 8; // columns per bar-style modifier row
     private static final long TAP_THRESHOLD_MS = 300; // below this, a step press+release is a tap
 
+    // Default values shown/applied for whole-clip editing (no held note to read from) and used
+    // as the starting point for a fresh note. Chance and length match Bitwig's own note defaults;
+    // timbre 0 is confirmed by spec. Pressure and velocity defaults aren't documented anywhere
+    // we've found, so these are reasonable assumptions: 0 pressure (no aftertouch applied is the
+    // natural "nothing" value), and velocity matching INSERT_VELOCITY (what notes we create
+    // actually get).
+    private static final double DEFAULT_CHANCE = 1.0;
+    private static final double DEFAULT_LENGTH_BEATS = STEP_SIZE_BEATS;
+    private static final double DEFAULT_TIMBRE_UI = 0.0;
+    private static final double DEFAULT_PRESSURE = 0.0;
+    private static final double DEFAULT_VELOCITY = INSERT_VELOCITY / 127.0;
+
     private static final int STEP_PLAYHEAD_COLOR = ColorLookup.WHITE;
     private static final int KEY_IDLE_COLOR = ColorLookup.TURQUOISE;
     private static final int KEY_HELD_COLOR = ColorLookup.WHITE;
@@ -104,6 +128,7 @@ public class LaunchpadSeqExtension extends ControllerExtension {
 
     private MidiIn midiIn;
     private MidiOut midiOut;
+    private Transport transport;
 
     private CursorTrack cursorTrack;
     private ClipLauncherSlotBank slotBank;
@@ -113,15 +138,18 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     private int octaveOffset = 0;
     private int lastPitch = BASE_NOTE;
     private int playingStep = -1;
-    // Which of the 8 recurrence cycles is currently playing, inferred by counting how many
-    // times playingStep() has wrapped back to the start of the clip's loop (there's no direct
-    // API for "current recurrence cycle"). Resets to 0 whenever playback stops.
-    private int recurrenceCycle = 0;
     private int displayStep = -1; // step currently held, whose modifiers rows 2-0 show/edit; -1 = none
     private int modifierMode = MODE_NOTE_OPS; // which Modifier Column radio button is selected
 
     private final Set<Integer> heldPianoKeys = new HashSet<>();
     private final Set<Integer> heldSteps = new HashSet<>();
+    // Clip pads (row 7) currently held, for whole-clip modifier editing - see the class doc comment.
+    private final Set<Integer> heldClipPads = new HashSet<>();
+    // Accumulator for the recurrence pattern being built up in whole-clip mode: there's no single
+    // representative note to read a "current" mask from, unlike single-step editing, so this is
+    // its own scratch state, reset to the default (off) each time a fresh clip-pad hold begins.
+    private int bulkRecurrenceMask = 0xFF;
+    private boolean bulkRecurrenceEnabled = false;
     // Columns currently held in row 2 while in Note Expressions mode, for the timbre chord gesture.
     private final Set<Integer> heldTimbreCols = new HashSet<>();
     // Steps that had a note placed (via a held piano key) or a modifier edited during the
@@ -154,6 +182,9 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         midiOut = host.getMidiOutPort(0);
         midiIn.setMidiCallback(this::onMidi);
 
+        transport = host.createTransport();
+        transport.getPosition().markInterested();
+
         cursorTrack = host.createCursorTrack("LAUNCHPAD_SEQ_TRACK", "Launchpad Seq", 0, 8, true);
 
         slotBank = cursorTrack.clipLauncherSlotBank();
@@ -171,11 +202,6 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         clip.setStepSize(STEP_SIZE_BEATS);
         clip.addNoteStepObserver(this::onNoteStepChanged);
         clip.playingStep().addValueObserver(v -> {
-            if (v < 0) {
-                recurrenceCycle = 0;
-            } else if (playingStep >= 0 && v < playingStep) {
-                recurrenceCycle = (recurrenceCycle + 1) % RECURRENCE_LENGTH;
-            }
             playingStep = v;
             host.requestFlush();
         });
@@ -210,11 +236,25 @@ public class LaunchpadSeqExtension extends ControllerExtension {
             sendColor(LpProtocol.gridNote(ROW_MOD_MID, col), modMidColor(col));
             sendColor(LpProtocol.gridNote(ROW_MOD_BOTTOM, col), modBottomColor(col));
         }
-        sendColor(LpProtocol.CC_OCTAVE_UP, CONTROL_IDLE_COLOR);
-        sendColor(LpProtocol.CC_OCTAVE_DOWN, CONTROL_IDLE_COLOR);
-        sendColor(LpProtocol.modifierColumnCC(ROW_MOD_TOP), modeButtonColor(MODE_NOTE_OPS));
-        sendColor(LpProtocol.modifierColumnCC(ROW_MOD_MID), modeButtonColor(MODE_NOTE_EXPRESSIONS));
-        sendColor(LpProtocol.modifierColumnCC(ROW_MOD_BOTTOM), modeButtonColor(MODE_RESERVED));
+        sendControlColor(LpProtocol.CC_OCTAVE_UP, CONTROL_IDLE_COLOR);
+        sendControlColor(LpProtocol.CC_OCTAVE_DOWN, CONTROL_IDLE_COLOR);
+        sendControlColor(LpProtocol.modifierColumnCC(ROW_MOD_TOP), modeButtonColor(MODE_NOTE_OPS));
+        sendControlColor(LpProtocol.modifierColumnCC(ROW_MOD_MID), modeButtonColor(MODE_NOTE_EXPRESSIONS));
+        sendControlColor(LpProtocol.modifierColumnCC(ROW_MOD_BOTTOM), modeButtonColor(MODE_RESERVED));
+    }
+
+    /**
+     * Which of the 8 recurrence cycles is "currently playing", taken as the transport's absolute
+     * bar position modulo 8 (a bar here being one clip length, since our clips are always 16
+     * steps / 4 beats). There's no direct API for a note's actual recurrence-cycle counter, so
+     * this is deliberately just that - a stateless read of where the main playhead is, not an
+     * attempt to track individual clip loop iterations (which was fragile - see git history).
+     */
+    private int currentRecurrenceCycle() {
+        final double beats = transport.getPosition().get();
+        final double clipLengthBeats = STEP_COUNT * STEP_SIZE_BEATS;
+        final int bar = (int) Math.floor(beats / clipLengthBeats);
+        return ((bar % RECURRENCE_LENGTH) + RECURRENCE_LENGTH) % RECURRENCE_LENGTH;
     }
 
     private int modeButtonColor(final int mode) {
@@ -261,88 +301,200 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     }
 
     private int recurrenceColor(final int col) {
-        final NoteStep note = displayedModifierNote();
-        if (note == null) {
-            return ColorLookup.OFF;
+        if (displayStep >= 0) {
+            final NoteStep note = displayedModifierNote();
+            if (note == null) {
+                return ColorLookup.OFF;
+            }
+            // No pattern applied yet (the default) shows as fully off, not as an all-on pattern -
+            // only an actually-applied mask lights anything here.
+            final boolean on = note.isRecurrenceEnabled() && ((note.recurrenceMask() >> col) & 1) != 0;
+            return recurrenceCellColor(on, col);
         }
-        // No pattern applied yet (the default) shows as fully off, not as an all-on pattern -
-        // only an actually-applied mask lights anything here.
-        final boolean on = note.isRecurrenceEnabled() && ((note.recurrenceMask() >> col) & 1) != 0;
-        final boolean playhead = playingStep >= 0 && col == recurrenceCycle;
+        if (!heldClipPads.isEmpty()) {
+            final boolean on = bulkRecurrenceEnabled && ((bulkRecurrenceMask >> col) & 1) != 0;
+            return recurrenceCellColor(on, col);
+        }
+        return ColorLookup.OFF;
+    }
+
+    private int recurrenceCellColor(final boolean on, final int col) {
+        final boolean playhead = playingStep >= 0 && col == currentRecurrenceCycle();
         if (playhead) {
             return on ? ColorLookup.PALE_YELLOW : ColorLookup.WHITE;
         }
         return on ? RECURRENCE_COLOR : ColorLookup.OFF;
     }
 
+    /** Chance 0-1, from the held step's lowest note, the whole-clip default, or null if neither
+     * a step nor a clip pad is held. */
+    private Double displayedChance() {
+        if (displayStep >= 0) {
+            final NoteStep note = displayedModifierNote();
+            return note == null ? null : (note.isChanceEnabled() ? note.chance() : DEFAULT_CHANCE);
+        }
+        return heldClipPads.isEmpty() ? null : DEFAULT_CHANCE;
+    }
+
     private int chanceColor(final int col) {
-        final NoteStep note = displayedModifierNote();
-        if (note == null) {
+        final Double chance = displayedChance();
+        if (chance == null) {
             return ColorLookup.OFF;
         }
-        final double chance = note.isChanceEnabled() ? note.chance() : 1.0;
         final int level = (int) Math.round(chance * MODIFIER_LEVELS);
         return col < level ? CHANCE_COLOR : ColorLookup.OFF;
     }
 
+    private Double displayedLengthBeats() {
+        if (displayStep >= 0) {
+            final NoteStep note = displayedModifierNote();
+            return note == null ? null : note.duration();
+        }
+        return heldClipPads.isEmpty() ? null : DEFAULT_LENGTH_BEATS;
+    }
+
     private int lengthColor(final int col) {
-        final NoteStep note = displayedModifierNote();
-        if (note == null) {
+        final Double lengthBeats = displayedLengthBeats();
+        if (lengthBeats == null) {
             return ColorLookup.OFF;
         }
-        final int level = (int) Math.round(note.duration() / STEP_SIZE_BEATS);
+        final int level = (int) Math.round(lengthBeats / STEP_SIZE_BEATS);
         return col < level ? LENGTH_COLOR : ColorLookup.OFF;
     }
 
+    private Double displayedTimbreUi() {
+        if (displayStep >= 0) {
+            final NoteStep note = displayedModifierNote();
+            return note == null ? null : note.timbre() * 100.0;
+        }
+        return heldClipPads.isEmpty() ? null : DEFAULT_TIMBRE_UI;
+    }
+
     private int timbreColor(final int col) {
-        final NoteStep note = displayedModifierNote();
-        if (note == null) {
+        final Double uiValue = displayedTimbreUi();
+        if (uiValue == null) {
             return ColorLookup.OFF;
         }
-        return timbreIndexLitColumns(timbreIndex(note.timbre()), col) ? TIMBRE_COLOR : ColorLookup.OFF;
+        return isTimbreColumnLit(uiValue, col) ? TIMBRE_COLOR : ColorLookup.OFF;
     }
 
-    /** Maps timbre's -1..1 API range to a 0-8 chord index: 0 and 8 are the single-pad extremes. */
-    private static int timbreIndex(final double timbre) {
-        final int index = (int) Math.round((timbre + 1.0) / 2.0 * MODIFIER_LEVELS);
-        return Math.max(0, Math.min(MODIFIER_LEVELS, index));
+    /**
+     * A single column, left to right, sets one of 8 evenly-spaced values skipping zero: -100,
+     * -75, -50, -25, 25, 50, 75, 100 (so there's a wider-than-usual gap between columns 3 and 4).
+     * Holding two adjacent columns together sets the midpoint of their two single-press values -
+     * e.g. columns 3 and 4 together land exactly on the skipped 0.
+     */
+    private static double timbreSingleValue(final int col) {
+        final int slot = col < 4 ? col : col + 1; // slots 0-8 are -100..100 in steps of 25; slot 4 (0) is skipped
+        return -100 + 25.0 * slot;
     }
 
-    /** Index 0 lights only column 0, index 8 only column 7, others light columns (index-1, index). */
-    private static boolean timbreIndexLitColumns(final int index, final int col) {
-        if (index == 0) {
-            return col == 0;
+    /** Finds whichever of the 8 single-press values or 7 adjacent-chord midpoints is closest to
+     * the given value, and reports whether that representation would light the given column. */
+    private static boolean isTimbreColumnLit(final double uiValue, final int col) {
+        int nearestSingleCol = 0;
+        double nearestSingleDiff = Double.MAX_VALUE;
+        for (int c = 0; c < MODIFIER_LEVELS; c++) {
+            final double diff = Math.abs(timbreSingleValue(c) - uiValue);
+            if (diff < nearestSingleDiff) {
+                nearestSingleDiff = diff;
+                nearestSingleCol = c;
+            }
         }
-        if (index == MODIFIER_LEVELS) {
-            return col == 7;
+        int nearestChordLo = 0;
+        double nearestChordDiff = Double.MAX_VALUE;
+        for (int c = 0; c < MODIFIER_LEVELS - 1; c++) {
+            final double mid = (timbreSingleValue(c) + timbreSingleValue(c + 1)) / 2.0;
+            final double diff = Math.abs(mid - uiValue);
+            if (diff < nearestChordDiff) {
+                nearestChordDiff = diff;
+                nearestChordLo = c;
+            }
         }
-        return col == index - 1 || col == index;
+        if (nearestSingleDiff <= nearestChordDiff) {
+            return col == nearestSingleCol;
+        }
+        return col == nearestChordLo || col == nearestChordLo + 1;
+    }
+
+    private Double displayedPressure() {
+        if (displayStep >= 0) {
+            final NoteStep note = displayedModifierNote();
+            return note == null ? null : note.pressure();
+        }
+        return heldClipPads.isEmpty() ? null : DEFAULT_PRESSURE;
     }
 
     private int pressureColor(final int col) {
-        final NoteStep note = displayedModifierNote();
-        if (note == null) {
+        final Double pressure = displayedPressure();
+        if (pressure == null) {
             return ColorLookup.OFF;
         }
-        final int level = (int) Math.round(note.pressure() * MODIFIER_LEVELS);
+        final int level = (int) Math.round(pressure * MODIFIER_LEVELS);
         return col < level ? PRESSURE_COLOR : ColorLookup.OFF;
     }
 
+    private Double displayedVelocity() {
+        if (displayStep >= 0) {
+            final NoteStep note = displayedModifierNote();
+            return note == null ? null : note.velocity();
+        }
+        return heldClipPads.isEmpty() ? null : DEFAULT_VELOCITY;
+    }
+
     private int velocityColor(final int col) {
-        final NoteStep note = displayedModifierNote();
-        if (note == null) {
+        final Double velocity = displayedVelocity();
+        if (velocity == null) {
             return ColorLookup.OFF;
         }
-        final int level = (int) Math.round(note.velocity() * MODIFIER_LEVELS);
+        final int level = (int) Math.round(velocity * MODIFIER_LEVELS);
         return col < level ? VELOCITY_COLOR : ColorLookup.OFF;
     }
 
+    /** Every (x, y) note cell that rows 2-0 currently edit: all notes in the held step, or (if no
+     * step is held) all notes in the whole clip while a clip pad is held. Empty if neither. */
+    private List<int[]> editTargetCells() {
+        final List<int[]> cells = new ArrayList<>();
+        if (displayStep >= 0) {
+            for (final int y : occupiedKeysPerStep[displayStep]) {
+                cells.add(new int[]{displayStep, y});
+            }
+        } else if (!heldClipPads.isEmpty()) {
+            for (int x = 0; x < STEP_COUNT; x++) {
+                for (final int y : occupiedKeysPerStep[x]) {
+                    cells.add(new int[]{x, y});
+                }
+            }
+        }
+        return cells;
+    }
+
+    /** Marks the held step as edited, so releasing it doesn't also toggle it off. No-op in
+     * whole-clip mode, which has no equivalent tap/hold gesture to protect. */
+    private void markEdited() {
+        if (displayStep >= 0) {
+            editedWhileHeld.add(displayStep);
+        }
+    }
+
+    /** For the 8x8 grid, which is note-addressed. */
     private void sendColor(final int index, final int paletteColor) {
+        sendColorViaStatus(LpProtocol.NOTE_STATUS, index, paletteColor);
+    }
+
+    /** For CC-addressed controls (top row, Modifier Column) - lighting these needs a CC message,
+     * not a Note-On; unlike Programmer mode, Session/DAW mode doesn't accept either for a given
+     * index interchangeably. */
+    private void sendControlColor(final int index, final int paletteColor) {
+        sendColorViaStatus(LpProtocol.CC_STATUS, index, paletteColor);
+    }
+
+    private void sendColorViaStatus(final int status, final int index, final int paletteColor) {
         if (lastSentColor[index] == paletteColor) {
             return;
         }
         lastSentColor[index] = paletteColor;
-        midiOut.sendMidi(LpProtocol.NOTE_STATUS, index, paletteColor);
+        midiOut.sendMidi(status, index, paletteColor);
     }
 
     private int clipPadColor(final int col) {
@@ -444,8 +596,8 @@ public class LaunchpadSeqExtension extends ControllerExtension {
 
         switch (row) {
             case ROW_CLIPS:
-                if (isOn && col < bankSize) {
-                    onClipPad(col);
+                if (col < bankSize) {
+                    onClipPad(col, isOn);
                 }
                 break;
             case ROW_STEPS_HI:
@@ -539,16 +691,26 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         getHost().requestFlush();
     }
 
-    private void onClipPad(final int col) {
-        final ClipLauncherSlot slot = slotBank.getItemAt(col);
-        if (slot.hasContent().get()) {
-            slot.select();
-            slot.launch();
+    private void onClipPad(final int col, final boolean isOn) {
+        if (isOn) {
+            if (heldClipPads.isEmpty() && displayStep < 0) {
+                bulkRecurrenceMask = 0xFF;
+                bulkRecurrenceEnabled = false;
+            }
+            heldClipPads.add(col);
+            final ClipLauncherSlot slot = slotBank.getItemAt(col);
+            if (slot.hasContent().get()) {
+                slot.select();
+                slot.launch();
+            } else {
+                slot.createEmptyClip(NEW_CLIP_LENGTH_BEATS);
+                slot.select();
+                getHost().scheduleTask(() -> clip.setStepSize(STEP_SIZE_BEATS), 50);
+            }
         } else {
-            slot.createEmptyClip(NEW_CLIP_LENGTH_BEATS);
-            slot.select();
-            getHost().scheduleTask(() -> clip.setStepSize(STEP_SIZE_BEATS), 50);
+            heldClipPads.remove(col);
         }
+        getHost().requestFlush();
     }
 
     private void onStepPad(final int x, final boolean isOn) {
@@ -584,47 +746,59 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     }
 
     private void onRecurrencePad(final int col) {
-        if (displayStep < 0 || occupiedKeysPerStep[displayStep].isEmpty()) {
+        final List<int[]> targets = editTargetCells();
+        if (targets.isEmpty()) {
             return;
         }
-        final int lowestY = Collections.min(occupiedKeysPerStep[displayStep]);
-        final NoteStep reference = clip.getStep(NOTE_CHANNEL, displayStep, lowestY);
-        final int currentMask = reference.isRecurrenceEnabled() ? reference.recurrenceMask() : 0xFF;
-        final int newMask = currentMask ^ (1 << col);
-        final boolean enable = newMask != 0xFF;
-        for (final int y : occupiedKeysPerStep[displayStep]) {
-            final NoteStep note = clip.getStep(NOTE_CHANNEL, displayStep, y);
+        final int newMask;
+        final boolean enable;
+        if (displayStep >= 0) {
+            final int lowestY = Collections.min(occupiedKeysPerStep[displayStep]);
+            final NoteStep reference = clip.getStep(NOTE_CHANNEL, displayStep, lowestY);
+            final int currentMask = reference.isRecurrenceEnabled() ? reference.recurrenceMask() : 0xFF;
+            newMask = currentMask ^ (1 << col);
+            enable = newMask != 0xFF;
+        } else {
+            bulkRecurrenceMask ^= (1 << col);
+            newMask = bulkRecurrenceMask;
+            enable = newMask != 0xFF;
+            bulkRecurrenceEnabled = enable;
+        }
+        for (final int[] cell : targets) {
+            final NoteStep note = clip.getStep(NOTE_CHANNEL, cell[0], cell[1]);
             note.setRecurrence(RECURRENCE_LENGTH, newMask);
             note.setIsRecurrenceEnabled(enable);
         }
-        editedWhileHeld.add(displayStep);
+        markEdited();
         getHost().requestFlush();
     }
 
     private void onChancePad(final int col) {
-        if (displayStep < 0 || occupiedKeysPerStep[displayStep].isEmpty()) {
+        final List<int[]> targets = editTargetCells();
+        if (targets.isEmpty()) {
             return;
         }
         final double newChance = (col + 1) / (double) MODIFIER_LEVELS;
         final boolean enable = newChance < 1.0;
-        for (final int y : occupiedKeysPerStep[displayStep]) {
-            final NoteStep note = clip.getStep(NOTE_CHANNEL, displayStep, y);
+        for (final int[] cell : targets) {
+            final NoteStep note = clip.getStep(NOTE_CHANNEL, cell[0], cell[1]);
             note.setChance(newChance);
             note.setIsChanceEnabled(enable);
         }
-        editedWhileHeld.add(displayStep);
+        markEdited();
         getHost().requestFlush();
     }
 
     private void onLengthPad(final int col) {
-        if (displayStep < 0 || occupiedKeysPerStep[displayStep].isEmpty()) {
+        final List<int[]> targets = editTargetCells();
+        if (targets.isEmpty()) {
             return;
         }
         final double newLength = (col + 1) * STEP_SIZE_BEATS;
-        for (final int y : occupiedKeysPerStep[displayStep]) {
-            clip.getStep(NOTE_CHANNEL, displayStep, y).setDuration(newLength);
+        for (final int[] cell : targets) {
+            clip.getStep(NOTE_CHANNEL, cell[0], cell[1]).setDuration(newLength);
         }
-        editedWhileHeld.add(displayStep);
+        markEdited();
         getHost().requestFlush();
     }
 
@@ -638,69 +812,66 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     }
 
     /**
-     * Applies a timbre value once the held columns in row 2 form a valid gesture: column 0 or
-     * column 7 alone (the -100/+100 extremes), or two adjacent held columns (a "chord" - e.g.
-     * columns 3 and 4 together set 0, the centre). Any other combination is ignored, so a user
-     * building up to a chord doesn't apply a stray value along the way.
+     * Applies a timbre value once the held columns in row 2 form a valid gesture: any single
+     * held column (its own value, per {@link #timbreSingleValue}), or two adjacent held columns
+     * (the midpoint of their two values - e.g. columns 3 and 4 together set 0). Any other
+     * combination is ignored, so a user building up to a chord doesn't apply a stray value along
+     * the way.
      */
     private void applyTimbreFromHeldCols() {
-        if (displayStep < 0 || occupiedKeysPerStep[displayStep].isEmpty()) {
+        final List<int[]> targets = editTargetCells();
+        if (targets.isEmpty()) {
             return;
         }
-        final Integer index = resolveTimbreIndex();
-        if (index == null) {
+        final Double uiValue = resolveTimbreValue();
+        if (uiValue == null) {
             return;
         }
-        final double newTimbre = (index / (double) MODIFIER_LEVELS) * 2.0 - 1.0;
-        for (final int y : occupiedKeysPerStep[displayStep]) {
-            clip.getStep(NOTE_CHANNEL, displayStep, y).setTimbre(newTimbre);
+        final double newTimbre = uiValue / 100.0;
+        for (final int[] cell : targets) {
+            clip.getStep(NOTE_CHANNEL, cell[0], cell[1]).setTimbre(newTimbre);
         }
-        editedWhileHeld.add(displayStep);
+        markEdited();
         getHost().requestFlush();
     }
 
     /** Null if the currently-held columns in row 2 don't form a valid timbre gesture. */
-    private Integer resolveTimbreIndex() {
+    private Double resolveTimbreValue() {
         if (heldTimbreCols.size() == 1) {
-            final int col = heldTimbreCols.iterator().next();
-            if (col == 0) {
-                return 0;
-            }
-            if (col == 7) {
-                return MODIFIER_LEVELS;
-            }
-            return null;
+            return timbreSingleValue(heldTimbreCols.iterator().next());
         }
         if (heldTimbreCols.size() == 2) {
             final int[] cols = heldTimbreCols.stream().mapToInt(Integer::intValue).sorted().toArray();
             if (cols[1] - cols[0] == 1) {
-                return cols[1];
+                return (timbreSingleValue(cols[0]) + timbreSingleValue(cols[1])) / 2.0;
             }
         }
         return null;
     }
 
     private void onPressurePad(final int col) {
-        if (displayStep < 0 || occupiedKeysPerStep[displayStep].isEmpty()) {
+        final List<int[]> targets = editTargetCells();
+        if (targets.isEmpty()) {
             return;
         }
         final double newPressure = (col + 1) / (double) MODIFIER_LEVELS;
-        for (final int y : occupiedKeysPerStep[displayStep]) {
-            clip.getStep(NOTE_CHANNEL, displayStep, y).setPressure(newPressure);
+        for (final int[] cell : targets) {
+            clip.getStep(NOTE_CHANNEL, cell[0], cell[1]).setPressure(newPressure);
         }
-        editedWhileHeld.add(displayStep);
+        markEdited();
         getHost().requestFlush();
     }
 
     private void onVelocityPad(final int col) {
-        if (displayStep < 0 || occupiedKeysPerStep[displayStep].isEmpty()) {
+        final List<int[]> targets = editTargetCells();
+        if (targets.isEmpty()) {
             return;
         }
         final double newVelocity = (col + 1) / (double) MODIFIER_LEVELS;
-        for (final int y : occupiedKeysPerStep[displayStep]) {
-            clip.getStep(NOTE_CHANNEL, displayStep, y).setVelocity(newVelocity);
+        for (final int[] cell : targets) {
+            clip.getStep(NOTE_CHANNEL, cell[0], cell[1]).setVelocity(newVelocity);
         }
-        editedWhileHeld.add(displayStep);
+        markEdited();
         getHost().requestFlush();
     }
 
