@@ -10,6 +10,15 @@ bottom**. The grid is 8x8; the 9th column just to the right of the grid is the
 **Modifier Column** - eight extra buttons, one per row, that don't light up as part of
 the grid itself but act as mode switches and hold-buttons for the features below.
 
+## Install
+Put the LaunchpadStepSequencer.bwextension file in your Bitwig Extensions folder (Documents/Bitwig/Extensions).
+In Bitwig’s settings/controllers, add a Novation Launchpad Mini MK3 controller and select "Launchpad Step Sequencer by Peter Nyboer vx.x.x"
+![bitwig settings screenshot](bitwig_controllers_screen.png)
+
+## Callouts
+![callouts for ngrid sequencer](callouts.jpg)
+
+
 ## The rows
 
 | Row | Function |
