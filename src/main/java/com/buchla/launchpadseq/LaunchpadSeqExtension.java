@@ -167,6 +167,7 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     private static final double DEFAULT_VELOCITY = INSERT_VELOCITY / 127.0;
 
     private static final int STEP_PLAYHEAD_COLOR = ColorLookup.WHITE;
+    private static final double SUSTAIN_COLOR_DIM_FACTOR = 0.4; // brightness for steps a note only sustains through
     private static final int KEY_IDLE_COLOR = ColorLookup.TURQUOISE;
     private static final int KEY_HELD_COLOR = ColorLookup.WHITE;
     private static final int CONTROL_IDLE_COLOR = ColorLookup.DIM_GREY;
@@ -245,7 +246,13 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     // step) from a hold used just to look at its modifiers (leaves the step alone either way).
     private final Map<Integer, Long> stepPressedAt = new HashMap<>();
     @SuppressWarnings("unchecked")
-    private final Set<Integer>[] occupiedKeysPerStep = new HashSet[STEP_COUNT];
+    private final Set<Integer>[] occupiedKeysPerStep = new HashSet[STEP_COUNT]; // NoteOn or NoteSustain
+    // Subset of occupiedKeysPerStep that's specifically NoteOn (the note actually starts here, not
+    // just sustaining through from an earlier step) - used only to dim sustain-only step LEDs, see
+    // stepPadColor. Editing logic elsewhere deliberately keeps using occupiedKeysPerStep, since a
+    // sustained cell is still a real, editable note.
+    @SuppressWarnings("unchecked")
+    private final Set<Integer>[] noteOnKeysPerStep = new HashSet[STEP_COUNT];
 
     // Last palette colour index sent per LED index, so flush() only sends what changed. -1 = never sent.
     private final int[] lastSentColor = new int[100];
@@ -260,6 +267,7 @@ public class LaunchpadSeqExtension extends ControllerExtension {
 
         for (int i = 0; i < STEP_COUNT; i++) {
             occupiedKeysPerStep[i] = new HashSet<>();
+            noteOnKeysPerStep[i] = new HashSet<>();
         }
         Arrays.fill(lastSentColor, -1);
 
@@ -401,6 +409,7 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         clip.scrollToStep(offset);
         for (int i = 0; i < STEP_COUNT; i++) {
             occupiedKeysPerStep[i].clear();
+            noteOnKeysPerStep[i].clear();
         }
         getHost().requestFlush();
     }
@@ -662,10 +671,19 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         if (x + viewOffset == playingStep) {
             return STEP_PLAYHEAD_COLOR;
         }
-        if (occupiedKeysPerStep[x].isEmpty()) {
-            return ColorLookup.DIM_GREY;
+        if (!noteOnKeysPerStep[x].isEmpty()) {
+            // A note actually starts here: full clip colour.
+            return ColorLookup.nearestPaletteIndex(clip.color().red(), clip.color().green(), clip.color().blue());
         }
-        return ColorLookup.nearestPaletteIndex(clip.color().red(), clip.color().green(), clip.color().blue());
+        if (!occupiedKeysPerStep[x].isEmpty()) {
+            // A longer note from an earlier step is only sustaining through here: same hue, dimmer,
+            // so the step it actually started on stands out.
+            return ColorLookup.nearestPaletteIndex(
+                (float) (clip.color().red() * SUSTAIN_COLOR_DIM_FACTOR),
+                (float) (clip.color().green() * SUSTAIN_COLOR_DIM_FACTOR),
+                (float) (clip.color().blue() * SUSTAIN_COLOR_DIM_FACTOR));
+        }
+        return ColorLookup.DIM_GREY;
     }
 
     private int blackKeyColor(final int col) {
@@ -715,8 +733,14 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         final int y = step.y();
         if (step.state() == NoteStep.State.Empty) {
             occupiedKeysPerStep[x].remove(y);
+            noteOnKeysPerStep[x].remove(y);
         } else {
             occupiedKeysPerStep[x].add(y);
+            if (step.state() == NoteStep.State.NoteOn) {
+                noteOnKeysPerStep[x].add(y);
+            } else {
+                noteOnKeysPerStep[x].remove(y); // NoteSustain: a note continues through here, doesn't start here
+            }
         }
         getHost().requestFlush();
     }
@@ -977,11 +1001,15 @@ public class LaunchpadSeqExtension extends ControllerExtension {
             final boolean wasTap = pressedAt != null
                 && System.currentTimeMillis() - pressedAt < TAP_THRESHOLD_MS;
             if (wasTap && !wasEdited) {
-                if (!occupiedKeysPerStep[x].isEmpty()) {
+                if (!noteOnKeysPerStep[x].isEmpty()) {
+                    // A note actually starts here: a tap clears it.
                     clip.clearStepsAtX(NOTE_CHANNEL, x);
-                } else {
+                } else if (occupiedKeysPerStep[x].isEmpty()) {
+                    // Genuinely empty: a tap adds one.
                     clip.toggleStep(NOTE_CHANNEL, x, lastPitch, INSERT_VELOCITY);
                 }
+                // Otherwise this step only has a longer note sustaining through it from an earlier
+                // step - leave it alone. A note can only be toggled off from its actual start step.
             }
             if (displayStep == x) {
                 displayStep = heldSteps.isEmpty() ? -1 : heldSteps.iterator().next();
