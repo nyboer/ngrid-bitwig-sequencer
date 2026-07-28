@@ -84,6 +84,13 @@ import java.util.Set;
  * length (see clipLengthBeats) also decides what loading it shows - loading an already-32-step
  * clip shows CC69's page - and what length a new clip is created at.
  *
+ * A fourth Modifier Column button, CC89 (next to row 7), sets an arbitrary clip length: hold it
+ * (it lights white while held) and press a step - any step on either page - to end the clip right
+ * after that step. Can be tapped repeatedly while still held to try different lengths. This is
+ * separate from the CC79/CC69 view buttons above, which only ever set 16 or 32 - CC89 can land
+ * anywhere from 1 to 32 steps. While held, step presses do only this; none of their normal
+ * tap/hold/combo behaviour runs.
+ *
  * Two more Modifier Column buttons, next to the piano rows, pick what a piano pad press actually
  * does - same press/chord pattern as the view buttons (a single press picks a mode, holding both
  * together is a third mode). CC59 (next to row 4, black keys, the default) is PIANO_MODE_HOLD -
@@ -190,6 +197,9 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     // a chord (both at once) can be told apart from two independent single presses - mirrors
     // heldViewButtons/onViewButtonPress.
     private final Set<Integer> heldPianoModeButtons = new HashSet<>();
+    // CC89 (Modifier Column, next to row 7): while held, a step press sets the clip's length to
+    // end at that step instead of doing its normal tap/hold/combo thing - see onStepPad.
+    private boolean lengthEditHeld = false;
     // Transport position (in beats) at which the clip's current run started - i.e. the last time
     // it was freshly launched or retriggered, not just looped naturally. Re-synced in the
     // playingStep() observer; see currentRecurrenceCycle for why this needs to exist at all.
@@ -296,10 +306,11 @@ public class LaunchpadSeqExtension extends ControllerExtension {
             host.requestFlush();
         });
         clip.color().addValueObserver((r, g, b) -> host.requestFlush());
-        clip.getPlayStop().addValueObserver(beats -> {
-            clipLengthBeats = beats;
-            setViewOffset(beats > NEW_CLIP_LENGTH_BEATS ? STEP_COUNT : 0);
-        });
+        // Only tracks the length passively here - deliberately does NOT also reset the view to
+        // match it, since this fires just as much for our own in-place length edits (CC89, CC69)
+        // as it does for switching to a different clip. The "reset view when a clip is (re)loaded"
+        // behaviour lives in onClipPad instead, where a clip load is actually happening.
+        clip.getPlayStop().addValueObserver(beats -> clipLengthBeats = beats);
 
         midiOut.sendSysex(LpProtocol.dawMode(true));
         midiOut.sendSysex(LpProtocol.selectLayout(0)); // Session layout
@@ -339,6 +350,7 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         sendControlColor(LpProtocol.modifierColumnCC(ROW_STEPS_LO), viewButtonColor(viewOffset == STEP_COUNT));
         sendControlColor(LpProtocol.modifierColumnCC(ROW_BLACK_KEYS), pianoModeButtonColor(PIANO_MODE_BUTTON_FIRST));
         sendControlColor(LpProtocol.modifierColumnCC(ROW_WHITE_KEYS), pianoModeButtonColor(PIANO_MODE_BUTTON_SECOND));
+        sendControlColor(LpProtocol.modifierColumnCC(ROW_CLIPS), lengthEditHeld ? MODE_ACTIVE_COLOR : ColorLookup.OFF);
     }
 
     /** Both view buttons light in auto-follow mode; otherwise only whichever matches the current page. */
@@ -812,6 +824,11 @@ public class LaunchpadSeqExtension extends ControllerExtension {
             onPianoModeButtonPress(PIANO_MODE_BUTTON_SECOND, isOn);
             return;
         }
+        if (cc == LpProtocol.modifierColumnCC(ROW_CLIPS)) {
+            lengthEditHeld = isOn;
+            getHost().requestFlush();
+            return;
+        }
         if (!isOn) {
             return;
         }
@@ -914,6 +931,12 @@ public class LaunchpadSeqExtension extends ControllerExtension {
                 slot.select();
                 getHost().scheduleTask(() -> clip.setStepSize(STEP_SIZE_BEATS), 50);
             }
+            // Reset the view to match whatever just got (re)loaded, once the retarget has settled -
+            // e.g. loading an already-32-step clip should show its second page. Delayed the same way
+            // setStepSize above is, since reading clip state immediately after select()/createEmptyClip()
+            // can still reflect the previous clip.
+            getHost().scheduleTask(
+                () -> setViewOffset(clipLengthBeats > NEW_CLIP_LENGTH_BEATS ? STEP_COUNT : 0), 50);
         } else {
             heldClipPads.remove(col);
         }
@@ -921,6 +944,12 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     }
 
     private void onStepPad(final int x, final boolean isOn) {
+        if (lengthEditHeld) {
+            if (isOn) {
+                setClipLengthToStep(x);
+            }
+            return;
+        }
         if (isOn) {
             heldSteps.add(x);
             displayStep = x;
@@ -950,6 +979,14 @@ public class LaunchpadSeqExtension extends ControllerExtension {
             }
         }
         getHost().requestFlush();
+    }
+
+    /** Sets the clip's length (both play-stop and loop length) so it ends right after the given
+     * step. Can be called repeatedly while CC89 is held to try different lengths. */
+    private void setClipLengthToStep(final int localX) {
+        final double newLength = (localX + viewOffset + 1) * STEP_SIZE_BEATS;
+        clip.getPlayStop().set(newLength);
+        clip.getLoopLength().set(newLength);
     }
 
     private void onRecurrencePad(final int col) {
