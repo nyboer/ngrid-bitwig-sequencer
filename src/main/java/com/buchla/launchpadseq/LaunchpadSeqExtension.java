@@ -42,8 +42,12 @@ import java.util.Set;
  *   - Note Expressions (row 1 button, CC29): row 2 = timbre, -100..100 and bipolar - each
  *     column alone sets one of 8 values skipping zero (-100,-75,-50,-25,25,50,75,100), and two
  *     adjacent held columns set the midpoint of theirs, e.g. columns 3+4 land on the skipped 0
- *     (see timbreSingleValue). Row 1 = pressure as a 0-8 bar in 12.5% increments, row 0 =
- *     velocity, same.
+ *     (see timbreSingleValue). Row 1 = pressure and row 0 = velocity, each a 0-8 bar in 12.5%
+ *     increments with the same adjacent-column chording as timbre (see resolveBarValue) - e.g.
+ *     columns 3+4 set 56.25%, the midpoint of 50% and 62.5%. Pressure's first column is special:
+ *     it normally sets 12.5%, but if pressure is already a low nonzero value (over 0%, under 13%)
+ *     a solo press of it clears to 0% instead, since the bar scale can otherwise never reach true
+ *     zero (see nextPressureForFirstColumn) - only for a solo press, not as part of a chord.
  *   - The row 0 button (CC19) is reserved; selecting it leaves rows 2-0 blank.
  * Whichever mode is active lights its Modifier Column button white; the other two are off.
  *
@@ -228,8 +232,11 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     // its own scratch state, reset to the default (off) each time a fresh clip-pad hold begins.
     private int bulkRecurrenceMask = 0xFF;
     private boolean bulkRecurrenceEnabled = false;
-    // Columns currently held in row 2 while in Note Expressions mode, for the timbre chord gesture.
+    // Columns currently held in rows 2/1/0 while in Note Expressions mode, for the timbre/pressure/
+    // velocity chord gestures (see resolveBarValue and resolveTimbreValue).
     private final Set<Integer> heldTimbreCols = new HashSet<>();
+    private final Set<Integer> heldPressureCols = new HashSet<>();
+    private final Set<Integer> heldVelocityCols = new HashSet<>();
     // Steps that had a note placed (via a held piano key) or a modifier edited during the
     // current hold - if a step is in here on release, its plain toggle/clear is skipped,
     // since the hold was clearly used to edit it rather than to tap it on/off.
@@ -767,14 +774,10 @@ public class LaunchpadSeqExtension extends ControllerExtension {
                 onModTopPad(col, isOn);
                 break;
             case ROW_MOD_MID:
-                if (isOn) {
-                    onModMidPad(col);
-                }
+                onModMidPad(col, isOn);
                 break;
             case ROW_MOD_BOTTOM:
-                if (isOn) {
-                    onModBottomPad(col);
-                }
+                onModBottomPad(col, isOn);
                 break;
             default:
                 break;
@@ -791,19 +794,23 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         }
     }
 
-    private void onModMidPad(final int col) {
+    private void onModMidPad(final int col, final boolean isOn) {
         if (modifierMode == MODE_NOTE_OPS) {
-            onChancePad(col);
+            if (isOn) {
+                onChancePad(col);
+            }
         } else if (modifierMode == MODE_NOTE_EXPRESSIONS) {
-            onPressurePad(col);
+            onPressurePad(col, isOn);
         }
     }
 
-    private void onModBottomPad(final int col) {
+    private void onModBottomPad(final int col, final boolean isOn) {
         if (modifierMode == MODE_NOTE_OPS) {
-            onLengthPad(col);
+            if (isOn) {
+                onLengthPad(col);
+            }
         } else if (modifierMode == MODE_NOTE_EXPRESSIONS) {
-            onVelocityPad(col);
+            onVelocityPad(col, isOn);
         }
     }
 
@@ -906,6 +913,8 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     private void setModifierMode(final int mode) {
         modifierMode = mode;
         heldTimbreCols.clear();
+        heldPressureCols.clear();
+        heldVelocityCols.clear();
         getHost().requestFlush();
     }
 
@@ -1047,12 +1056,15 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     }
 
     private void onTimbrePad(final int col, final boolean isOn) {
+        // Only applies on press, not release: releasing one button of a chord would otherwise
+        // recompute against whatever's still held (a single column), overwriting the chord's
+        // midpoint with that column's own value instead of leaving the chorded value in place.
         if (isOn) {
             heldTimbreCols.add(col);
+            applyTimbreFromHeldCols();
         } else {
             heldTimbreCols.remove(col);
         }
-        applyTimbreFromHeldCols();
     }
 
     /**
@@ -1093,12 +1105,63 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         return null;
     }
 
-    private void onPressurePad(final int col) {
+    /**
+     * Shared by pressure and velocity: a single held column sets its own 1-8 bar value (12.5%,
+     * 25%, ... 100%), and two adjacent held columns set the midpoint of theirs - e.g. columns 3
+     * and 4 (50% and 62.5%) together set 56.25%. Same chord pattern as timbre, just against the
+     * plain unipolar bar scale instead of timbre's bipolar one. Null if the held columns don't
+     * form a valid single-press or adjacent-chord gesture.
+     */
+    private Double resolveBarValue(final Set<Integer> heldCols) {
+        if (heldCols.size() == 1) {
+            return barSingleValue(heldCols.iterator().next());
+        }
+        if (heldCols.size() == 2) {
+            final int[] cols = heldCols.stream().mapToInt(Integer::intValue).sorted().toArray();
+            if (cols[1] - cols[0] == 1) {
+                return (barSingleValue(cols[0]) + barSingleValue(cols[1])) / 2.0;
+            }
+        }
+        return null;
+    }
+
+    private static double barSingleValue(final int col) {
+        return (col + 1) / (double) MODIFIER_LEVELS;
+    }
+
+    private void onPressurePad(final int col, final boolean isOn) {
+        // Only applies on press - see the comment in onTimbrePad for why.
+        if (isOn) {
+            heldPressureCols.add(col);
+            applyPressureFromHeldCols();
+        } else {
+            heldPressureCols.remove(col);
+        }
+    }
+
+    private void applyPressureFromHeldCols() {
         final List<int[]> targets = editTargetCells();
         if (targets.isEmpty()) {
             return;
         }
-        final double newPressure = (col + 1) / (double) MODIFIER_LEVELS;
+        // The first-column zero-toggle (see nextPressureForFirstColumn) only applies to a solo
+        // press of that column - as part of a chord it should behave like any other column, using
+        // its normal 12.5% value for the midpoint calculation.
+        //
+        // Deliberately an if/else, not a ternary: nextPressureForFirstColumn() returns a primitive
+        // double and resolveBarValue() returns a nullable Double, and a ternary mixing those two
+        // types forces the whole expression to unbox the Double side unconditionally (Java's
+        // binary numeric promotion), throwing NPE the moment resolveBarValue legitimately returns
+        // null instead of ever reaching the null check below.
+        final Double newPressure;
+        if (heldPressureCols.equals(Set.of(0))) {
+            newPressure = nextPressureForFirstColumn();
+        } else {
+            newPressure = resolveBarValue(heldPressureCols);
+        }
+        if (newPressure == null) {
+            return;
+        }
         for (final int[] cell : targets) {
             clip.getStep(NOTE_CHANNEL, cell[0], cell[1]).setPressure(newPressure);
         }
@@ -1106,12 +1169,37 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         getHost().requestFlush();
     }
 
-    private void onVelocityPad(final int col) {
+    /**
+     * The first pressure column normally sets 12.5%, the bottom of the plain 1-8 bar scale - but
+     * that scale can never reach true 0%. If the currently-shown pressure is already a low nonzero
+     * value (over 0% and under 13%), pressing it again clears it to 0% instead, so there's a way to
+     * reach zero at all.
+     */
+    private double nextPressureForFirstColumn() {
+        final Double current = displayedPressure();
+        final double currentUi = current == null ? 0.0 : current * 100.0;
+        return currentUi > 0 && currentUi < 13 ? 0.0 : 1.0 / MODIFIER_LEVELS;
+    }
+
+    private void onVelocityPad(final int col, final boolean isOn) {
+        // Only applies on press - see the comment in onTimbrePad for why.
+        if (isOn) {
+            heldVelocityCols.add(col);
+            applyVelocityFromHeldCols();
+        } else {
+            heldVelocityCols.remove(col);
+        }
+    }
+
+    private void applyVelocityFromHeldCols() {
         final List<int[]> targets = editTargetCells();
         if (targets.isEmpty()) {
             return;
         }
-        final double newVelocity = (col + 1) / (double) MODIFIER_LEVELS;
+        final Double newVelocity = resolveBarValue(heldVelocityCols);
+        if (newVelocity == null) {
+            return;
+        }
         for (final int[] cell : targets) {
             clip.getStep(NOTE_CHANNEL, cell[0], cell[1]).setVelocity(newVelocity);
         }
