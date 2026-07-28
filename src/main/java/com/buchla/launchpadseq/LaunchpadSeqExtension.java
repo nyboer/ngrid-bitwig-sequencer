@@ -8,6 +8,7 @@ import com.bitwig.extension.controller.api.ControllerHost;
 import com.bitwig.extension.controller.api.CursorTrack;
 import com.bitwig.extension.controller.api.MidiIn;
 import com.bitwig.extension.controller.api.MidiOut;
+import com.bitwig.extension.controller.api.NoteInput;
 import com.bitwig.extension.controller.api.NoteStep;
 import com.bitwig.extension.controller.api.PinnableCursorClip;
 import com.bitwig.extension.controller.api.Transport;
@@ -67,13 +68,42 @@ import java.util.Set;
  * timbre, etc. - see the displayedXxx methods) rather than any particular note's, and any edit
  * applies to every note in the whole clip, not just one step's. A held step always takes
  * priority over a held clip pad if both happen to be held at once.
+ *
+ * Clips are normally 16 steps (1 bar), but two more Modifier Column buttons - CC79 (next to row
+ * 6) and CC69 (next to row 5) - extend that. Pressing CC79 alone shows/edits steps 1-16; CC69
+ * alone extends the clip to 32 steps (if it wasn't already) and shows/edits steps 17-32 - neither
+ * ever shrinks the clip back down, so switching between them never loses anything in 17-32.
+ * Holding both down together (a chord, in either press order) turns on auto-follow instead: both
+ * buttons light, and the view automatically jumps to whichever page contains the playhead as the
+ * clip plays (see the playingStep() observer in init). Pressing either button on its own again -
+ * a single press, not part of a chord - turns auto-follow back off and fixes the view on that
+ * button's page, including while stopped, so you can always get to either page to program it.
+ * Implemented via clip.scrollToStep(), not by resizing the note-grid window itself - the 16
+ * physical step pads always address "whatever's currently scrolled into view", so the rest of
+ * the step/modifier logic doesn't need to know there's more than 16 steps at all. A clip's actual
+ * length (see clipLengthBeats) also decides what loading it shows - loading an already-32-step
+ * clip shows CC69's page - and what length a new clip is created at.
+ *
+ * Two more Modifier Column buttons, next to the piano rows, pick what a piano pad press actually
+ * does - same press/chord pattern as the view buttons (a single press picks a mode, holding both
+ * together is a third mode). CC59 (next to row 4, black keys, the default) is PIANO_MODE_HOLD -
+ * the hold-a-piano-pad-then-press-a-step behaviour described above. CC49 (next to row 3, white
+ * keys) is PIANO_MODE_LIVE_STEP: pressing a piano pad immediately toggles that pitch on whatever
+ * step the playhead is currently on (jumping the view to that page first if needed), with no step
+ * pad involved at all - a live-record-while-playing gesture. Chording both is PIANO_MODE_PLAY_ALONG:
+ * pressing a piano pad just plays that note (via a dedicated NoteInput, "Launchpad Seq Play
+ * Along" - the user has to select it as a track's input in Bitwig for anything to actually sound,
+ * same as any other MIDI controller) and writes nothing to the clip at all. Octave shift (the
+ * black-key row's columns 0 and 7) isn't part of this dispatch and works identically in all three
+ * modes, so transposition stays consistent regardless of which piano mode is active.
  */
 public class LaunchpadSeqExtension extends ControllerExtension {
 
     private static final int STEP_COUNT = 16;
     private static final int GRID_HEIGHT = 128;
     private static final double STEP_SIZE_BEATS = 0.25; // sixteenth notes: 16 steps = 1 bar of 4/4
-    private static final int NEW_CLIP_LENGTH_BEATS = 4;
+    private static final int NEW_CLIP_LENGTH_BEATS = 4; // 16 steps, 1 bar
+    private static final int LONG_CLIP_LENGTH_BEATS = NEW_CLIP_LENGTH_BEATS * 2; // 32 steps, 2 bars
     private static final int INSERT_VELOCITY = 100;
     private static final int NOTE_CHANNEL = 0;
 
@@ -97,6 +127,17 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     private static final int MODE_NOTE_OPS = 0;
     private static final int MODE_NOTE_EXPRESSIONS = 1;
     private static final int MODE_RESERVED = 2;
+
+    private static final int VIEW_MODE_FIXED = 0;
+    private static final int VIEW_MODE_AUTO = 1;
+    private static final int VIEW_BUTTON_PAGE_0 = 0;
+    private static final int VIEW_BUTTON_PAGE_1 = 1;
+
+    private static final int PIANO_MODE_HOLD = 0; // hold a piano pad, press a step to place it (default)
+    private static final int PIANO_MODE_LIVE_STEP = 1; // press a piano pad to place it at the playhead's step
+    private static final int PIANO_MODE_PLAY_ALONG = 2; // press a piano pad to just play it, no step writes
+    private static final int PIANO_MODE_BUTTON_FIRST = 0; // CC59, black-key row - PIANO_MODE_HOLD
+    private static final int PIANO_MODE_BUTTON_SECOND = 1; // CC49, white-key row - PIANO_MODE_LIVE_STEP
 
     private static final int RECURRENCE_LENGTH = 8;
     private static final int MODIFIER_LEVELS = 8; // columns per bar-style modifier row
@@ -129,6 +170,10 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     private MidiIn midiIn;
     private MidiOut midiOut;
     private Transport transport;
+    // Note-input purely for injecting notes into whatever track's input the user assigns it to,
+    // for PIANO_MODE_PLAY_ALONG - never receives real hardware input (see the never-matching mask
+    // passed to createNoteInput in init).
+    private NoteInput previewNoteInput;
 
     private CursorTrack cursorTrack;
     private ClipLauncherSlotBank slotBank;
@@ -137,9 +182,32 @@ public class LaunchpadSeqExtension extends ControllerExtension {
 
     private int octaveOffset = 0;
     private int lastPitch = BASE_NOTE;
-    private int playingStep = -1;
+    private int playingStep = -1; // absolute step index across the whole clip; -1 = not playing
     private int displayStep = -1; // step currently held, whose modifiers rows 2-0 show/edit; -1 = none
     private int modifierMode = MODE_NOTE_OPS; // which Modifier Column radio button is selected
+    private int pianoMode = PIANO_MODE_HOLD; // which of the two piano-mode buttons is selected
+    // Which of the two piano-mode buttons (PIANO_MODE_BUTTON_FIRST/SECOND) are currently held, so
+    // a chord (both at once) can be told apart from two independent single presses - mirrors
+    // heldViewButtons/onViewButtonPress.
+    private final Set<Integer> heldPianoModeButtons = new HashSet<>();
+    // Transport position (in beats) at which the clip's current run started - i.e. the last time
+    // it was freshly launched or retriggered, not just looped naturally. Re-synced in the
+    // playingStep() observer; see currentRecurrenceCycle for why this needs to exist at all.
+    private double clipTriggerBeats = 0.0;
+
+    // Which 16-step page of the clip the step/piano/modifier rows currently address: 0 or
+    // STEP_COUNT. Kept in sync with clip.scrollToStep() - see setViewOffset.
+    private int viewOffset = 0;
+    // Fixed (view buttons manually pick the page) or auto (the page follows the playhead while
+    // playing) - see onViewButtonPress and the auto-follow check in the playingStep() observer.
+    private int viewMode = VIEW_MODE_FIXED;
+    // Which of the two view buttons (VIEW_BUTTON_PAGE_0/1) are currently held, so a chord (both
+    // held at once) can be told apart from two independent single presses - see onViewButtonPress.
+    private final Set<Integer> heldViewButtons = new HashSet<>();
+    // The loaded clip's actual current length in beats, tracked from clip.getPlayStop() - used to
+    // decide whether there's a second page at all, and to reset viewOffset when a different clip
+    // (of possibly different length) gets loaded.
+    private double clipLengthBeats = NEW_CLIP_LENGTH_BEATS;
 
     private final Set<Integer> heldPianoKeys = new HashSet<>();
     private final Set<Integer> heldSteps = new HashSet<>();
@@ -181,6 +249,10 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         midiIn = host.getMidiInPort(0);
         midiOut = host.getMidiOutPort(0);
         midiIn.setMidiCallback(this::onMidi);
+        // "FF????" never matches anything the Launchpad itself sends (it only ever sends channel
+        // voice messages, 0x80-0xEF), so this note input never intercepts our own grid/CC parsing
+        // above - it exists purely so sendRawMidiEvent can inject notes for PIANO_MODE_PLAY_ALONG.
+        previewNoteInput = midiIn.createNoteInput("Launchpad Seq Play Along", "FF????");
 
         transport = host.createTransport();
         transport.getPosition().markInterested();
@@ -202,10 +274,32 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         clip.setStepSize(STEP_SIZE_BEATS);
         clip.addNoteStepObserver(this::onNoteStepChanged);
         clip.playingStep().addValueObserver(v -> {
+            // playingStep() is absolute across the whole clip (unlike NoteStep.x(), which is
+            // relative to the current scroll window) - confirmed by testing, not just assumed.
+            // -1 means this clip isn't currently playing at all.
+            if (v >= 0 && (playingStep < 0 || v < playingStep)) {
+                final int lastStep = (int) Math.round(clipLengthBeats / STEP_SIZE_BEATS) - 1;
+                final boolean naturalWrap = playingStep == lastStep;
+                if (!naturalWrap) {
+                    // A fresh start from stopped, or a retrigger mid-playback (a jump back from
+                    // somewhere other than the clip's actual last step): re-sync the recurrence
+                    // phase anchor so this pass counts as the first one again. A natural wrap
+                    // (playingStep really did just reach the last step) leaves it alone, since the
+                    // pass count should keep advancing continuously through those.
+                    clipTriggerBeats = transport.getPosition().get() - v * STEP_SIZE_BEATS;
+                }
+            }
+            if (viewMode == VIEW_MODE_AUTO && clipLengthBeats > NEW_CLIP_LENGTH_BEATS && v >= 0) {
+                setViewOffset(v >= STEP_COUNT ? STEP_COUNT : 0);
+            }
             playingStep = v;
             host.requestFlush();
         });
         clip.color().addValueObserver((r, g, b) -> host.requestFlush());
+        clip.getPlayStop().addValueObserver(beats -> {
+            clipLengthBeats = beats;
+            setViewOffset(beats > NEW_CLIP_LENGTH_BEATS ? STEP_COUNT : 0);
+        });
 
         midiOut.sendSysex(LpProtocol.dawMode(true));
         midiOut.sendSysex(LpProtocol.selectLayout(0)); // Session layout
@@ -241,20 +335,55 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         sendControlColor(LpProtocol.modifierColumnCC(ROW_MOD_TOP), modeButtonColor(MODE_NOTE_OPS));
         sendControlColor(LpProtocol.modifierColumnCC(ROW_MOD_MID), modeButtonColor(MODE_NOTE_EXPRESSIONS));
         sendControlColor(LpProtocol.modifierColumnCC(ROW_MOD_BOTTOM), modeButtonColor(MODE_RESERVED));
+        sendControlColor(LpProtocol.modifierColumnCC(ROW_STEPS_HI), viewButtonColor(viewOffset == 0));
+        sendControlColor(LpProtocol.modifierColumnCC(ROW_STEPS_LO), viewButtonColor(viewOffset == STEP_COUNT));
+        sendControlColor(LpProtocol.modifierColumnCC(ROW_BLACK_KEYS), pianoModeButtonColor(PIANO_MODE_BUTTON_FIRST));
+        sendControlColor(LpProtocol.modifierColumnCC(ROW_WHITE_KEYS), pianoModeButtonColor(PIANO_MODE_BUTTON_SECOND));
+    }
+
+    /** Both view buttons light in auto-follow mode; otherwise only whichever matches the current page. */
+    private int viewButtonColor(final boolean isCurrentPage) {
+        if (viewMode == VIEW_MODE_AUTO) {
+            return MODE_ACTIVE_COLOR;
+        }
+        return isCurrentPage ? MODE_ACTIVE_COLOR : ColorLookup.OFF;
+    }
+
+    /** Both piano-mode buttons light in play-along mode; otherwise only whichever matches the current mode. */
+    private int pianoModeButtonColor(final int button) {
+        if (pianoMode == PIANO_MODE_PLAY_ALONG) {
+            return MODE_ACTIVE_COLOR;
+        }
+        final int expectedMode = button == PIANO_MODE_BUTTON_FIRST ? PIANO_MODE_HOLD : PIANO_MODE_LIVE_STEP;
+        return pianoMode == expectedMode ? MODE_ACTIVE_COLOR : ColorLookup.OFF;
     }
 
     /**
      * Which of the 8 recurrence cycles is "currently playing", taken as the transport's absolute
-     * bar position modulo 8 (a bar here being one clip length, since our clips are always 16
-     * steps / 4 beats). There's no direct API for a note's actual recurrence-cycle counter, so
-     * this is deliberately just that - a stateless read of where the main playhead is, not an
-     * attempt to track individual clip loop iterations (which was fragile - see git history).
+     * position - relative to clipTriggerBeats, i.e. when the clip's current run actually started -
+     * modulo the clip's own length (in "bars", one bar being one clip length). There's no direct
+     * API for a note's actual recurrence-cycle counter, so this is deliberately an approximation:
+     * mostly a stateless read of where the main playhead is (so it can't accumulate drift the way
+     * an incremental counter did in an earlier version - see git history), but anchored to the
+     * clip's last (re)trigger so it stays in phase across retriggers, which a purely stateless
+     * transport-position-modulo-length calculation doesn't know about at all.
      */
     private int currentRecurrenceCycle() {
         final double beats = transport.getPosition().get();
-        final double clipLengthBeats = STEP_COUNT * STEP_SIZE_BEATS;
-        final int bar = (int) Math.floor(beats / clipLengthBeats);
+        final int bar = (int) Math.floor((beats - clipTriggerBeats) / clipLengthBeats);
         return ((bar % RECURRENCE_LENGTH) + RECURRENCE_LENGTH) % RECURRENCE_LENGTH;
+    }
+
+    private void setViewOffset(final int offset) {
+        if (offset == viewOffset) {
+            return;
+        }
+        viewOffset = offset;
+        clip.scrollToStep(offset);
+        for (int i = 0; i < STEP_COUNT; i++) {
+            occupiedKeysPerStep[i].clear();
+        }
+        getHost().requestFlush();
     }
 
     private int modeButtonColor(final int mode) {
@@ -509,7 +638,9 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     }
 
     private int stepPadColor(final int x) {
-        if (x == playingStep) {
+        // playingStep() is absolute across the whole clip, unlike note addressing (x), which is
+        // relative to the current scroll window - so it needs the view offset added back in.
+        if (x + viewOffset == playingStep) {
             return STEP_PLAYHEAD_COLOR;
         }
         if (occupiedKeysPerStep[x].isEmpty()) {
@@ -578,9 +709,7 @@ public class LaunchpadSeqExtension extends ControllerExtension {
             final boolean isOn = type == LpProtocol.NOTE_STATUS && data2 > 0;
             handleNote(data1, isOn);
         } else if (type == LpProtocol.CC_STATUS) {
-            if (data2 > 0) {
-                handleControl(data1);
-            }
+            handleControl(data1, data2 > 0);
         }
     }
 
@@ -666,7 +795,26 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         }
     }
 
-    private void handleControl(final int cc) {
+    private void handleControl(final int cc, final boolean isOn) {
+        if (cc == LpProtocol.modifierColumnCC(ROW_STEPS_HI)) {
+            onViewButtonPress(VIEW_BUTTON_PAGE_0, isOn);
+            return;
+        }
+        if (cc == LpProtocol.modifierColumnCC(ROW_STEPS_LO)) {
+            onViewButtonPress(VIEW_BUTTON_PAGE_1, isOn);
+            return;
+        }
+        if (cc == LpProtocol.modifierColumnCC(ROW_BLACK_KEYS)) {
+            onPianoModeButtonPress(PIANO_MODE_BUTTON_FIRST, isOn);
+            return;
+        }
+        if (cc == LpProtocol.modifierColumnCC(ROW_WHITE_KEYS)) {
+            onPianoModeButtonPress(PIANO_MODE_BUTTON_SECOND, isOn);
+            return;
+        }
+        if (!isOn) {
+            return;
+        }
         if (cc == LpProtocol.CC_OCTAVE_UP) {
             shiftOctave(1);
         } else if (cc == LpProtocol.CC_OCTAVE_DOWN) {
@@ -678,6 +826,64 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         } else if (cc == LpProtocol.modifierColumnCC(ROW_MOD_BOTTOM)) {
             setModifierMode(MODE_RESERVED);
         }
+    }
+
+    /**
+     * A single press (from no view button held) fixes the view to that button's page, turning
+     * off auto-follow if it was on. Holding both down at once - a chord, in either order - turns
+     * auto-follow on instead. Releases don't change anything by themselves; only a fresh press
+     * does, so letting go of one button after a chord doesn't fall back to "fixed" on the other.
+     */
+    private void onViewButtonPress(final int button, final boolean isOn) {
+        if (!isOn) {
+            heldViewButtons.remove(button);
+            return;
+        }
+        heldViewButtons.add(button);
+        if (heldViewButtons.size() == 2) {
+            viewMode = VIEW_MODE_AUTO;
+        } else if (heldViewButtons.size() == 1) {
+            viewMode = VIEW_MODE_FIXED;
+            if (button == VIEW_BUTTON_PAGE_1) {
+                clip.getPlayStop().set(LONG_CLIP_LENGTH_BEATS);
+                clip.getLoopLength().set(LONG_CLIP_LENGTH_BEATS);
+            }
+            setViewOffset(button == VIEW_BUTTON_PAGE_0 ? 0 : STEP_COUNT);
+        }
+        getHost().requestFlush();
+    }
+
+    /**
+     * Same press/chord pattern as onViewButtonPress: a single press (from neither held) fixes the
+     * piano mode to that button's mode; holding both down at once (a chord, either order) switches
+     * to PIANO_MODE_PLAY_ALONG instead.
+     */
+    private void onPianoModeButtonPress(final int button, final boolean isOn) {
+        if (!isOn) {
+            heldPianoModeButtons.remove(button);
+            return;
+        }
+        heldPianoModeButtons.add(button);
+        if (heldPianoModeButtons.size() == 2) {
+            setPianoMode(PIANO_MODE_PLAY_ALONG);
+        } else if (heldPianoModeButtons.size() == 1) {
+            setPianoMode(button == PIANO_MODE_BUTTON_FIRST ? PIANO_MODE_HOLD : PIANO_MODE_LIVE_STEP);
+        }
+    }
+
+    private void setPianoMode(final int mode) {
+        if (mode == pianoMode) {
+            return;
+        }
+        if (pianoMode == PIANO_MODE_PLAY_ALONG) {
+            // Stop anything left sounding from play-along mode before leaving it, so a key that's
+            // still physically held when the mode changes doesn't turn into a stuck note.
+            for (final int y : heldPianoKeys) {
+                previewNoteInput.sendRawMidiEvent(0x80, y, 0);
+            }
+        }
+        pianoMode = mode;
+        getHost().requestFlush();
     }
 
     private void setModifierMode(final int mode) {
@@ -703,7 +909,8 @@ public class LaunchpadSeqExtension extends ControllerExtension {
                 slot.select();
                 slot.launch();
             } else {
-                slot.createEmptyClip(NEW_CLIP_LENGTH_BEATS);
+                final int newClipLength = viewOffset == STEP_COUNT ? LONG_CLIP_LENGTH_BEATS : NEW_CLIP_LENGTH_BEATS;
+                slot.createEmptyClip(newClipLength);
                 slot.select();
                 getHost().scheduleTask(() -> clip.setStepSize(STEP_SIZE_BEATS), 50);
             }
@@ -719,7 +926,7 @@ public class LaunchpadSeqExtension extends ControllerExtension {
             displayStep = x;
             editedWhileHeld.remove(x);
             stepPressedAt.put(x, System.currentTimeMillis());
-            if (!heldPianoKeys.isEmpty()) {
+            if (pianoMode == PIANO_MODE_HOLD && !heldPianoKeys.isEmpty()) {
                 for (final int y : heldPianoKeys) {
                     clip.toggleStep(NOTE_CHANNEL, x, y, INSERT_VELOCITY);
                 }
@@ -877,16 +1084,46 @@ public class LaunchpadSeqExtension extends ControllerExtension {
 
     private void onPianoPad(final int offset, final boolean isOn) {
         final int y = pitchForOffset(offset);
+        // heldPianoKeys tracks physical press state for LED feedback in every mode, regardless of
+        // what that press actually does functionally below.
         if (isOn) {
             heldPianoKeys.add(y);
             lastPitch = y;
-            for (final int x : heldSteps) {
-                clip.toggleStep(NOTE_CHANNEL, x, y, INSERT_VELOCITY);
-                editedWhileHeld.add(x);
-            }
         } else {
             heldPianoKeys.remove(y);
         }
+
+        if (pianoMode == PIANO_MODE_HOLD) {
+            if (isOn) {
+                for (final int x : heldSteps) {
+                    clip.toggleStep(NOTE_CHANNEL, x, y, INSERT_VELOCITY);
+                    editedWhileHeld.add(x);
+                }
+            }
+        } else if (pianoMode == PIANO_MODE_LIVE_STEP) {
+            if (isOn) {
+                recordNoteAtPlayhead(y);
+            }
+        } else { // PIANO_MODE_PLAY_ALONG
+            previewNoteInput.sendRawMidiEvent(isOn ? 0x90 : 0x80, y, isOn ? INSERT_VELOCITY : 0);
+        }
+
         getHost().requestFlush();
+    }
+
+    /**
+     * Toggles a note at the pitch y on whatever step the playhead is currently on. If the playhead
+     * isn't in the currently-shown page, jumps the view to the page it's actually in first, so the
+     * newly (or no longer) placed note is visible where it landed rather than silently written
+     * off-screen. Does nothing if the clip isn't playing - there's no "current step" to place at.
+     */
+    private void recordNoteAtPlayhead(final int y) {
+        if (playingStep < 0) {
+            return;
+        }
+        if (playingStep < viewOffset || playingStep >= viewOffset + STEP_COUNT) {
+            setViewOffset(playingStep >= STEP_COUNT ? STEP_COUNT : 0);
+        }
+        clip.toggleStep(NOTE_CHANNEL, playingStep - viewOffset, y, INSERT_VELOCITY);
     }
 }
