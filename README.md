@@ -3,6 +3,10 @@
 A Bitwig Studio controller extension that turns a Novation Launchpad Mini [MK3] into a
 step sequencer for editing note-grid clips.
 
+## Documentation
+
+Check the "documentation" folder!
+
 ## Grid layout
 
 Rows, top to bottom:
