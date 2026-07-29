@@ -82,7 +82,9 @@ view buttons above:
 - **Mode 2: Live-step mode** - pressing a piano key immediately toggles that
   pitch on whatever step the playhead is currently on (jumping the view to that page
   first if needed). No step pad needed - useful for recording live while the clip
-  plays.
+  plays. Also sounds the note as you press it (same as Play-along mode below, and
+  with the same "Launchpad Seq Play Along" input requirement) so you can hear what
+  you're entering.
 - **Hold both together: Play-along mode** - pressing a piano key just plays the
   note (you'll need to select "Launchpad Seq Play Along” or “All Ins" as a track's input in Bitwig
   to actually hear anything) and writes nothing to the clip.

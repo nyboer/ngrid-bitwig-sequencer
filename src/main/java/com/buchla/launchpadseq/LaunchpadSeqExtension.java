@@ -101,10 +101,12 @@ import java.util.Set;
  * the hold-a-piano-pad-then-press-a-step behaviour described above. CC49 (next to row 3, white
  * keys) is PIANO_MODE_LIVE_STEP: pressing a piano pad immediately toggles that pitch on whatever
  * step the playhead is currently on (jumping the view to that page first if needed), with no step
- * pad involved at all - a live-record-while-playing gesture. Chording both is PIANO_MODE_PLAY_ALONG:
- * pressing a piano pad just plays that note (via a dedicated NoteInput, "Launchpad Seq Play
- * Along" - the user has to select it as a track's input in Bitwig for anything to actually sound,
- * same as any other MIDI controller) and writes nothing to the clip at all. Octave shift (the
+ * pad involved at all - a live-record-while-playing gesture. It also sounds the pitch as it's
+ * pressed, same as PIANO_MODE_PLAY_ALONG below, so entered notes are audible immediately rather
+ * than only once the playhead loops back around. Chording both is PIANO_MODE_PLAY_ALONG: pressing
+ * a piano pad just plays that note (via a dedicated NoteInput, "Launchpad Seq Play Along" - the
+ * user has to select it as a track's input in Bitwig for anything to actually sound, same as any
+ * other MIDI controller) and writes nothing to the clip at all. Octave shift (the
  * black-key row's columns 0 and 7) isn't part of this dispatch and works identically in all three
  * modes, so transposition stays consistent regardless of which piano mode is active.
  */
@@ -1257,6 +1259,7 @@ public class LaunchpadSeqExtension extends ControllerExtension {
             if (isOn) {
                 recordNoteAtPlayhead(y);
             }
+            previewNoteInput.sendRawMidiEvent(isOn ? 0x90 : 0x80, y, isOn ? INSERT_VELOCITY : 0);
         } else { // PIANO_MODE_PLAY_ALONG
             previewNoteInput.sendRawMidiEvent(isOn ? 0x90 : 0x80, y, isOn ? INSERT_VELOCITY : 0);
         }
