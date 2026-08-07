@@ -56,8 +56,9 @@ By default a new clip is 16 steps, press the *page 2* button to extend a clip to
   timbre/pressure/velocity, depending on mode. With the pad held, you can edit the note modifies with the bottom buttons.
 
 If a step holds a note longer than one step, the pads it sustains through light in a
-dimmer version of the clip's color. Tapping a dimmer
-"sustain" pad does nothing. You must use the start of the note.
+dimmer version of the clip's color. Tapping a dimmer "sustain" pad does nothing, and
+holding one shows no modifiers to edit either - only the pad the note actually starts
+on can be tapped or held to work with it.
 
 While a clip is playing, the step currently under the playhead lights white.
 

@@ -92,12 +92,22 @@ Three files under `src/main/java/com/buchla/launchpadseq/`:
   an already-on step to inspect/edit its modifiers without also toggling it off; it went through a
   couple of iterations to get right, so don't simplify it back to "toggle on press" without
   re-reading why.
-- **Multi-note steps**: rows 2/1/0 always show/edit the *lowest-pitched* note on the held step, but
-  edits apply to every note on that step (`displayedModifierNote`, `occupiedKeysPerStep`).
-- **`occupiedKeysPerStep`** (which (step, pitch) cells currently hold a note) is maintained purely
-  from Bitwig's own `addNoteStepObserver` callback, not computed locally - it's the source of truth
-  for step/row rendering and must stay in sync with whatever `NoteStep.State` reports, including
-  edits made by the user with the mouse in Bitwig's own clip editor.
+- **Multi-note steps**: rows 2/1/0 always show/edit the *lowest-pitched note that actually starts on
+  the held step* - never a step that only has a longer note sustaining through it (`noteOnKeysPerStep`,
+  not `occupiedKeysPerStep`; see `displayedModifierNote`/`editTargetCells`) - and edits apply to every
+  such note on that step.
+- **`occupiedKeysPerStep`/`noteOnKeysPerStep`** (which (step, pitch) cells currently hold a note, and
+  which of those are the note's actual start vs. just sustain, respectively) are kept in sync two ways:
+  incrementally via Bitwig's `addNoteStepObserver` callback for live edits (including ones made with
+  the mouse in Bitwig's own clip editor), and rebuilt from scratch via `refreshVisibleSteps()` (a
+  direct `clip.getStep()` pull) any time the view's identity changes - `scrollToStep()` in
+  `setViewOffset`, or loading a different clip in `onClipPad`. The pull exists because
+  `addNoteStepObserver` only fires when a given (channel, x, y) address's *reported value* changes -
+  after scrolling moves a different absolute step into relative position x, if that step's
+  occupied/empty state happens to coincidentally match what was last reported at that same x on the
+  previous page, no callback ever arrives, silently leaving a cleared entry wrong until something else
+  happens to touch that exact cell. Found via a real bug report: a step's LED could stay dark forever
+  after paging away and back, despite the note genuinely being there.
 
 ## Reference material used while building this
 

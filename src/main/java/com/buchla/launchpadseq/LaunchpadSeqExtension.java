@@ -64,8 +64,10 @@ import java.util.Set;
  *
  * Rows 2-0 normally reflect and edit the note(s) on whichever step is currently held down
  * (rows 6/5): if a step holds more than one note, they show/edit the lowest-pitched one, and
- * edits apply to every note in that step. They're blank when no step is held or the held step
- * is empty - there's nothing to show or edit until a note exists.
+ * edits apply to every note in that step. They're blank when no step is held, or the held step
+ * has no note actually starting on it - a step a longer note only sustains through (see the dim
+ * LED colour under stepPadColor) has nothing of its own to show or edit, same as it has nothing
+ * a tap can toggle off (see onStepPad).
  *
  * Holding a clip pad (row 7) instead of a step - with no step held - switches rows 2-0 to
  * whole-clip mode: they show default values (recurrence off, 100% chance, 1/16 length, 0
@@ -409,11 +411,36 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         }
         viewOffset = offset;
         clip.scrollToStep(offset);
-        for (int i = 0; i < STEP_COUNT; i++) {
-            occupiedKeysPerStep[i].clear();
-            noteOnKeysPerStep[i].clear();
-        }
+        refreshVisibleSteps();
         getHost().requestFlush();
+    }
+
+    /**
+     * Rebuilds occupiedKeysPerStep/noteOnKeysPerStep for the whole current view window by
+     * directly querying every cell, instead of clearing them and waiting on addNoteStepObserver
+     * to repopulate. addNoteStepObserver only fires for a given (channel, x, y) address when its
+     * reported value actually changes - so after scrollToStep() moves a different absolute step
+     * into relative position x, if that step's occupied/empty state happens to match whatever was
+     * last reported at that same x on the previous page, no callback ever arrives, and a merely
+     * cleared entry stays incorrectly empty until something else touches that exact cell. Pulling
+     * ground truth here instead of waiting for a push avoids that gap; addNoteStepObserver still
+     * handles incremental updates once the window is settled (including edits made with the mouse
+     * in Bitwig's own clip editor).
+     */
+    private void refreshVisibleSteps() {
+        for (int x = 0; x < STEP_COUNT; x++) {
+            occupiedKeysPerStep[x].clear();
+            noteOnKeysPerStep[x].clear();
+            for (int y = 0; y < GRID_HEIGHT; y++) {
+                final NoteStep step = clip.getStep(NOTE_CHANNEL, x, y);
+                if (step.state() != NoteStep.State.Empty) {
+                    occupiedKeysPerStep[x].add(y);
+                    if (step.state() == NoteStep.State.NoteOn) {
+                        noteOnKeysPerStep[x].add(y);
+                    }
+                }
+            }
+        }
     }
 
     private int modeButtonColor(final int mode) {
@@ -450,12 +477,17 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         return ColorLookup.OFF;
     }
 
-    /** The step whose modifier note (lowest pitch) rows 2-0 are showing, or null if none. */
+    /** The step whose modifier note (lowest pitch) rows 2-0 are showing, or null if none. Keyed
+     * off noteOnKeysPerStep, not occupiedKeysPerStep - a step that only has a longer note's
+     * sustain passing through it (not actually starting there) has nothing of its own to show or
+     * edit, same as it has nothing a tap can toggle off (see onStepPad). Reading/writing a
+     * NoteStep at a sustain-only address isn't meaningful and was the source of stale/incorrect
+     * step LEDs when a modifier row was edited while holding such a step. */
     private NoteStep displayedModifierNote() {
-        if (displayStep < 0 || occupiedKeysPerStep[displayStep].isEmpty()) {
+        if (displayStep < 0 || noteOnKeysPerStep[displayStep].isEmpty()) {
             return null;
         }
-        final int lowestY = Collections.min(occupiedKeysPerStep[displayStep]);
+        final int lowestY = Collections.min(noteOnKeysPerStep[displayStep]);
         return clip.getStep(NOTE_CHANNEL, displayStep, lowestY);
     }
 
@@ -611,16 +643,19 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     }
 
     /** Every (x, y) note cell that rows 2-0 currently edit: all notes in the held step, or (if no
-     * step is held) all notes in the whole clip while a clip pad is held. Empty if neither. */
+     * step is held) all notes in the whole clip while a clip pad is held. Empty if neither. Uses
+     * noteOnKeysPerStep, not occupiedKeysPerStep - only cells where a note actually starts are
+     * real, editable notes; a longer note's sustain cells at other x's aren't separate notes and
+     * writing to them (e.g. setDuration) doesn't hit a meaningful NoteStep. */
     private List<int[]> editTargetCells() {
         final List<int[]> cells = new ArrayList<>();
         if (displayStep >= 0) {
-            for (final int y : occupiedKeysPerStep[displayStep]) {
+            for (final int y : noteOnKeysPerStep[displayStep]) {
                 cells.add(new int[]{displayStep, y});
             }
         } else if (!heldClipPads.isEmpty()) {
             for (int x = 0; x < STEP_COUNT; x++) {
-                for (final int y : occupiedKeysPerStep[x]) {
+                for (final int y : noteOnKeysPerStep[x]) {
                     cells.add(new int[]{x, y});
                 }
             }
@@ -969,9 +1004,19 @@ public class LaunchpadSeqExtension extends ControllerExtension {
             // Reset the view to match whatever just got (re)loaded, once the retarget has settled -
             // e.g. loading an already-32-step clip should show its second page. Delayed the same way
             // setStepSize above is, since reading clip state immediately after select()/createEmptyClip()
-            // can still reflect the previous clip.
-            getHost().scheduleTask(
-                () -> setViewOffset(clipLengthBeats > NEW_CLIP_LENGTH_BEATS ? STEP_COUNT : 0), 50);
+            // can still reflect the previous clip. Always refreshes the step/key mirror too, even if
+            // the target page happens to match the page already shown - setViewOffset only does that
+            // as a side effect of an actual page change, but this is a different clip's data now
+            // regardless, so the mirror needs rebuilding either way.
+            getHost().scheduleTask(() -> {
+                final int newOffset = clipLengthBeats > NEW_CLIP_LENGTH_BEATS ? STEP_COUNT : 0;
+                if (newOffset == viewOffset) {
+                    refreshVisibleSteps();
+                    getHost().requestFlush();
+                } else {
+                    setViewOffset(newOffset);
+                }
+            }, 50);
         } else {
             heldClipPads.remove(col);
         }
@@ -1036,8 +1081,7 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         final int newMask;
         final boolean enable;
         if (displayStep >= 0) {
-            final int lowestY = Collections.min(occupiedKeysPerStep[displayStep]);
-            final NoteStep reference = clip.getStep(NOTE_CHANNEL, displayStep, lowestY);
+            final NoteStep reference = displayedModifierNote();
             final int currentMask = reference.isRecurrenceEnabled() ? reference.recurrenceMask() : 0xFF;
             newMask = currentMask ^ (1 << col);
             enable = newMask != 0xFF;
