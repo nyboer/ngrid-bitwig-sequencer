@@ -2,6 +2,7 @@ package com.buchla.launchpadseq;
 
 import com.bitwig.extension.controller.ControllerExtension;
 import com.bitwig.extension.controller.ControllerExtensionDefinition;
+import com.bitwig.extension.controller.api.BooleanValue;
 import com.bitwig.extension.controller.api.ClipLauncherSlot;
 import com.bitwig.extension.controller.api.ClipLauncherSlotBank;
 import com.bitwig.extension.controller.api.ControllerHost;
@@ -11,6 +12,9 @@ import com.bitwig.extension.controller.api.MidiOut;
 import com.bitwig.extension.controller.api.NoteInput;
 import com.bitwig.extension.controller.api.NoteStep;
 import com.bitwig.extension.controller.api.PinnableCursorClip;
+import com.bitwig.extension.controller.api.SceneBank;
+import com.bitwig.extension.controller.api.Track;
+import com.bitwig.extension.controller.api.TrackBank;
 import com.bitwig.extension.controller.api.Transport;
 
 import java.util.ArrayList;
@@ -24,6 +28,26 @@ import java.util.Set;
 
 /**
  * Step sequencer for editing note-grid clips from a Launchpad Mini [MK3]'s 8x8 pad grid.
+ *
+ * The device's four physical top-row page buttons - Session/Drums/Keys/User (CC95-98) - select
+ * one of four independent pages (see the Page enum and setPage). Everything described below this
+ * paragraph (grid layout, Modifier Column, piano modes, etc.) applies only to the User page,
+ * which is the sequencer described here and is selected by default. Session is a full 8x8
+ * clip/scene launcher (see onSessionPad/renderSessionGrid) - unrelated to the sequencer's own
+ * row-7 single-row clip launcher below, which still only exists on the User page. Both Session and
+ * User are confirmed working on real hardware, including setPage's SysEx re-assertion, which turned
+ * out to be needed for User specifically (see CLAUDE.md's "Four-page model" note).
+ *
+ * Drums and Keys are deliberately near-empty on our side: pressing those physical buttons makes the
+ * device's firmware reconfigure the grid to send real drum-pad/chromatic note-on messages, but -
+ * confirmed via hardware testing plus Bitwig's own bundled Launchpad Mini MK3 extension's port
+ * declarations - that traffic arrives on the device's separate plain "MIDI" port (getMidiInPort(1)
+ * in LaunchpadSeqExtensionDefinition), not the "DAW" port (getMidiInPort(0)) everything else in
+ * this class talks to. So this class's only job for those two pages is to stay out of the way: send
+ * no LED colours (so the device's own native coloring shows through) and leave hardwareNoteInput -
+ * a real, non-injection-only NoteInput registered on that second port - to let Bitwig route the
+ * traffic to whatever track the user assigns it to; no code-side note handling needed at all, since
+ * it never passes through onMidi in the first place.
  *
  * Grid layout (rows counted from the bottom pad row, as in Novation's numbering):
  *   row 7 (top)    - clip launcher slots for the cursor track (8 clips)
@@ -183,6 +207,12 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     private static final int PRESSURE_COLOR = ColorLookup.PURPLE;
     private static final int VELOCITY_COLOR = ColorLookup.GREEN;
 
+    // Which of the device's four physical top-row page buttons (Session/Drums/Keys/User, CC95-98)
+    // is currently selected - see the class doc comment and setPage. USER (today's sequencer) is
+    // the default, matching the extension's previous always-on behaviour.
+    private enum Page { SESSION, DRUMS, KEYS, USER }
+    private Page currentPage = Page.USER;
+
     private MidiIn midiIn;
     private MidiOut midiOut;
     private Transport transport;
@@ -190,11 +220,23 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     // for PIANO_MODE_PLAY_ALONG - never receives real hardware input (see the never-matching mask
     // passed to createNoteInput in init).
     private NoteInput previewNoteInput;
+    // Real passthrough note input for the Drums/Keys/User pages' raw firmware-generated note
+    // traffic, registered on the device's separate plain "MIDI" port - see the class doc comment.
+    // The user assigns this as a track's input in Bitwig, same as previewNoteInput, but this one
+    // actually receives hardware input.
+    private NoteInput hardwareNoteInput;
 
     private CursorTrack cursorTrack;
     private ClipLauncherSlotBank slotBank;
     private int bankSize;
     private PinnableCursorClip clip;
+
+    // Session page: a full 8x8 clip/scene launcher grid, independent of the sequencer's own
+    // single-row row-7 launcher above (cursorTrack/slotBank), which stays User-page-only.
+    private TrackBank sessionTrackBank;
+    private SceneBank sessionSceneBank;
+    private final Track[] sessionTracks = new Track[8];
+    private final ClipLauncherSlot[][] sessionSlots = new ClipLauncherSlot[8][8]; // [trackIndex][sceneIndex]
 
     private int octaveOffset = 0;
     private int lastPitch = BASE_NOTE;
@@ -282,6 +324,14 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         // voice messages, 0x80-0xEF), so this note input never intercepts our own grid/CC parsing
         // above - it exists purely so sendRawMidiEvent can inject notes for PIANO_MODE_PLAY_ALONG.
         previewNoteInput = midiIn.createNoteInput("Launchpad Seq Play Along", "FF????");
+        // Real passthrough for whatever note traffic the Drums/Keys/User pages' firmware generates.
+        // Confirmed via hardware testing (and Bitwig's own bundled LaunchPadMiniMk3ExtensionDefinition)
+        // that this device exposes a SEPARATE "MIDI" port pair, entirely distinct from the "DAW" port
+        // everything else in this class talks to - Drums/Keys note-performance data never reaches
+        // port 0's midiIn/onMidi at all, no matter what channel filtering is applied there. Registered
+        // on getMidiInPort(1) instead, declared in LaunchpadSeqExtensionDefinition.
+        hardwareNoteInput = host.getMidiInPort(1).createNoteInput(
+            "Launchpad Seq Input", "8?????", "9?????", "A?????", "D?????");
 
         transport = host.createTransport();
         transport.getPosition().markInterested();
@@ -296,6 +346,36 @@ public class LaunchpadSeqExtension extends ControllerExtension {
             slot.hasContent().addValueObserver(v -> host.requestFlush());
             slot.isPlaying().addValueObserver(v -> host.requestFlush());
             slot.color().addValueObserver((r, g, b) -> host.requestFlush());
+        }
+
+        sessionTrackBank = host.createMainTrackBank(8, 0, 8);
+        sessionSceneBank = sessionTrackBank.sceneBank();
+        sessionSceneBank.canScrollBackwards().markInterested();
+        sessionSceneBank.canScrollForwards().markInterested();
+        sessionSceneBank.canScrollBackwards().addValueObserver(v -> host.requestFlush());
+        sessionSceneBank.canScrollForwards().addValueObserver(v -> host.requestFlush());
+        sessionTrackBank.canScrollBackwards().markInterested();
+        sessionTrackBank.canScrollForwards().markInterested();
+        sessionTrackBank.canScrollBackwards().addValueObserver(v -> host.requestFlush());
+        sessionTrackBank.canScrollForwards().addValueObserver(v -> host.requestFlush());
+        for (int t = 0; t < 8; t++) {
+            final Track track = sessionTrackBank.getItemAt(t);
+            sessionTracks[t] = track;
+            track.exists().markInterested();
+            track.exists().addValueObserver(v -> host.requestFlush());
+            final ClipLauncherSlotBank trackSlots = track.clipLauncherSlotBank();
+            // Auto-sized to numScenes=8 from createMainTrackBank above - no setSizeOfBank needed.
+            for (int s = 0; s < 8; s++) {
+                final ClipLauncherSlot slot = trackSlots.getItemAt(s);
+                sessionSlots[t][s] = slot;
+                slot.hasContent().markInterested();
+                slot.hasContent().addValueObserver(v -> host.requestFlush());
+                slot.isPlaying().markInterested();
+                slot.isPlaying().addValueObserver(v -> host.requestFlush());
+                slot.isPlaybackQueued().markInterested();
+                slot.isPlaybackQueued().addValueObserver(v -> host.requestFlush());
+                slot.color().addValueObserver((r, g, b) -> host.requestFlush());
+            }
         }
 
         clip = cursorTrack.createLauncherCursorClip(STEP_COUNT, GRID_HEIGHT);
@@ -332,7 +412,11 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         clip.getPlayStop().addValueObserver(beats -> clipLengthBeats = beats);
 
         midiOut.sendSysex(LpProtocol.dawMode(true));
-        midiOut.sendSysex(LpProtocol.selectLayout(0)); // Session layout
+        // Layout 0 ("Session layout" in Novation's SysEx terminology) is what gives the grid its
+        // channel-0, note-address-11-88 protocol - unrelated to the Page enum/physical top-row
+        // buttons above despite the name collision. Selected once, permanently; never call
+        // selectLayout again for Drums/Keys/User/Page.SESSION - see the class doc comment.
+        midiOut.sendSysex(LpProtocol.selectLayout(0));
 
         host.requestFlush();
     }
@@ -344,6 +428,32 @@ public class LaunchpadSeqExtension extends ControllerExtension {
 
     @Override
     public void flush() {
+        // Explicitly light whichever of the four page buttons is current, on every page - the
+        // device's own autonomous indicator for these four is unreliable (confirmed via hardware
+        // testing: after switching pages, the wrong one could be left lit), so this overrides it
+        // rather than trusting the firmware to track it correctly.
+        sendControlColor(LpProtocol.CC_SESSION, pageButtonColor(Page.SESSION));
+        sendControlColor(LpProtocol.CC_DRUMS, pageButtonColor(Page.DRUMS));
+        sendControlColor(LpProtocol.CC_KEYS, pageButtonColor(Page.KEYS));
+        sendControlColor(LpProtocol.CC_USER, pageButtonColor(Page.USER));
+        switch (currentPage) {
+            case USER:
+                flushUserPage();
+                break;
+            case SESSION:
+                renderSessionGrid();
+                break;
+            case DRUMS:
+            case KEYS:
+                break; // send nothing else - the device's own native firmware coloring shows through
+        }
+    }
+
+    private int pageButtonColor(final Page page) {
+        return currentPage == page ? MODE_ACTIVE_COLOR : ColorLookup.OFF;
+    }
+
+    private void flushUserPage() {
         for (int col = 0; col < 8; col++) {
             sendColor(LpProtocol.gridNote(ROW_CLIPS, col), clipPadColor(col));
         }
@@ -370,6 +480,47 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         sendControlColor(LpProtocol.modifierColumnCC(ROW_BLACK_KEYS), pianoModeButtonColor(PIANO_MODE_BUTTON_FIRST));
         sendControlColor(LpProtocol.modifierColumnCC(ROW_WHITE_KEYS), pianoModeButtonColor(PIANO_MODE_BUTTON_SECOND));
         sendControlColor(LpProtocol.modifierColumnCC(ROW_CLIPS), lengthEditHeld ? MODE_ACTIVE_COLOR : ColorLookup.OFF);
+    }
+
+    private static final double SESSION_STOPPED_DIM_FACTOR = SUSTAIN_COLOR_DIM_FACTOR; // reuse existing "present but not primary" convention
+
+    private void renderSessionGrid() {
+        for (int row = 0; row < 8; row++) {
+            for (int col = 0; col < 8; col++) {
+                sendColor(LpProtocol.gridNote(row, col), sessionPadColor(col, 7 - row));
+            }
+        }
+        sendControlColor(LpProtocol.CC_OCTAVE_UP, scrollAffordanceColor(sessionSceneBank.canScrollBackwards()));
+        sendControlColor(LpProtocol.CC_OCTAVE_DOWN, scrollAffordanceColor(sessionSceneBank.canScrollForwards()));
+        sendControlColor(LpProtocol.CC_LEFT, scrollAffordanceColor(sessionTrackBank.canScrollBackwards()));
+        sendControlColor(LpProtocol.CC_RIGHT, scrollAffordanceColor(sessionTrackBank.canScrollForwards()));
+    }
+
+    private int scrollAffordanceColor(final BooleanValue canScroll) {
+        return canScroll.get() ? CONTROL_IDLE_COLOR : ColorLookup.OFF;
+    }
+
+    private int sessionPadColor(final int trackIndex, final int sceneIndex) {
+        if (!sessionTracks[trackIndex].exists().get()) {
+            return ColorLookup.OFF;
+        }
+        final ClipLauncherSlot slot = sessionSlots[trackIndex][sceneIndex];
+        if (!slot.hasContent().get()) {
+            return ColorLookup.OFF;
+        }
+        final float r = slot.color().red();
+        final float g = slot.color().green();
+        final float b = slot.color().blue();
+        if (slot.isPlaying().get()) {
+            return ColorLookup.nearestPaletteIndex(r, g, b);
+        }
+        if (slot.isPlaybackQueued().get()) {
+            return ColorLookup.WHITE; // imminent-trigger, matches STEP_PLAYHEAD_COLOR's convention elsewhere
+        }
+        return ColorLookup.nearestPaletteIndex(
+            (float) (r * SESSION_STOPPED_DIM_FACTOR),
+            (float) (g * SESSION_STOPPED_DIM_FACTOR),
+            (float) (b * SESSION_STOPPED_DIM_FACTOR));
     }
 
     /** Both view buttons light in auto-follow mode; otherwise only whichever matches the current page. */
@@ -802,6 +953,13 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         if (col > 7) {
             return;
         }
+        if (currentPage == Page.SESSION) {
+            onSessionPad(row, col, isOn);
+            return;
+        }
+        if (currentPage != Page.USER) {
+            return; // DRUMS/KEYS: no-op here - onMidi's channel filter already excludes their traffic
+        }
 
         switch (row) {
             case ROW_CLIPS:
@@ -876,6 +1034,53 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     }
 
     private void handleControl(final int cc, final boolean isOn) {
+        // Page switching works from any page, regardless of what else is currently held.
+        if (cc == LpProtocol.CC_SESSION) {
+            if (isOn) {
+                reassertGridProtocol();
+                setPage(Page.SESSION);
+            }
+            return;
+        }
+        if (cc == LpProtocol.CC_DRUMS) {
+            if (isOn) {
+                setPage(Page.DRUMS);
+            }
+            return;
+        }
+        if (cc == LpProtocol.CC_KEYS) {
+            if (isOn) {
+                setPage(Page.KEYS);
+            }
+            return;
+        }
+        if (cc == LpProtocol.CC_USER) {
+            if (isOn) {
+                reassertGridProtocol();
+                setPage(Page.USER);
+            }
+            return;
+        }
+
+        if (currentPage == Page.SESSION) {
+            if (!isOn) {
+                return;
+            }
+            if (cc == LpProtocol.CC_OCTAVE_UP) {
+                sessionSceneBank.scrollBy(-1);
+            } else if (cc == LpProtocol.CC_OCTAVE_DOWN) {
+                sessionSceneBank.scrollBy(1);
+            } else if (cc == LpProtocol.CC_LEFT) {
+                sessionTrackBank.scrollBy(-1);
+            } else if (cc == LpProtocol.CC_RIGHT) {
+                sessionTrackBank.scrollBy(1);
+            }
+            return;
+        }
+        if (currentPage != Page.USER) {
+            return; // DRUMS/KEYS: no CCs are meaningful here
+        }
+
         if (cc == LpProtocol.modifierColumnCC(ROW_STEPS_HI)) {
             onViewButtonPress(VIEW_BUTTON_PAGE_0, isOn);
             return;
@@ -911,6 +1116,47 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         } else if (cc == LpProtocol.modifierColumnCC(ROW_MOD_BOTTOM)) {
             setModifierMode(MODE_RESERVED);
         }
+    }
+
+    /**
+     * Re-sends the DAW-mode-enable and layout-select SysEx, and forces a full LED repaint. Called
+     * on every Session/User button press, regardless of whether that press actually changes
+     * currentPage - unlike setPage's own repaint, this can't be skipped just because the software
+     * page didn't change, since the physical button press itself is what needs correcting here.
+     *
+     * The physical User button is very likely Novation's "Custom Mode" (Bitwig's own bundled Mini
+     * MK3 script literally calls this LpMode.CUSTOM) - the same "Lighting Custom Mode" this class's
+     * doc-adjacent notes already warned changes the LED protocol entirely (RGB SysEx instead of
+     * Note-On palette, silently doing nothing under the other) - and the device's firmware seems to
+     * re-enter that mode on every physical press of Session/User, not just the first one that
+     * actually changes pages. Confirmed via hardware testing: pressing User a second time in a row
+     * (already on the User page, so a naive "only act on page change" guard would skip this) left
+     * the grid dark and leaking note messages to hardwareNoteInput's assigned track exactly like the
+     * original blank-User bug, until this was called unconditionally on every press instead of only
+     * on page transitions. Re-asserting our own known-good DAW-mode + layout-0 state pulls the
+     * device back out of whatever the firmware did autonomously - a defensive reset rather than a
+     * precise undo, since the exact Custom Mode entry/exit SysEx isn't documented anywhere available
+     * here.
+     */
+    private void reassertGridProtocol() {
+        midiOut.sendSysex(LpProtocol.dawMode(true));
+        midiOut.sendSysex(LpProtocol.selectLayout(0));
+        Arrays.fill(lastSentColor, -1);
+        getHost().requestFlush();
+    }
+
+    /** Switches the active top-row page, forcing a full LED repaint if the page actually changed -
+     * the lastSentColor cache would otherwise go stale on Drums/Keys pages (flush() sends nothing
+     * there, since the device's own firmware repaints those LEDs autonomously) and could skip
+     * re-sending cells on return whose cached colour happens to match even though the physical LED
+     * shows something else. */
+    private void setPage(final Page page) {
+        if (page == currentPage) {
+            return;
+        }
+        currentPage = page;
+        Arrays.fill(lastSentColor, -1);
+        getHost().requestFlush();
     }
 
     /**
@@ -1021,6 +1267,21 @@ public class LaunchpadSeqExtension extends ControllerExtension {
             heldClipPads.remove(col);
         }
         getHost().requestFlush();
+    }
+
+    /** Session page: launches a clip slot on press. Deliberately doesn't replicate onClipPad's
+     * empty-slot createEmptyClip behaviour - that exists there because the row-7 launcher doubles
+     * as "pick which clip the sequencer edits"; this grid is a pure launcher. */
+    private void onSessionPad(final int row, final int col, final boolean isOn) {
+        if (!isOn) {
+            return;
+        }
+        final int trackIndex = col;
+        final int sceneIndex = 7 - row; // row 7 (top) = scene 0
+        if (!sessionTracks[trackIndex].exists().get()) {
+            return;
+        }
+        sessionSlots[trackIndex][sceneIndex].launch();
     }
 
     private void onStepPad(final int x, final boolean isOn) {

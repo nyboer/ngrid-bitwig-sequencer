@@ -48,7 +48,7 @@ public class LaunchpadSeqExtensionDefinition extends ControllerExtensionDefiniti
 
     @Override
     public int getNumMidiInPorts() {
-        return 1;
+        return 2;
     }
 
     @Override
@@ -59,19 +59,26 @@ public class LaunchpadSeqExtensionDefinition extends ControllerExtensionDefiniti
     @Override
     public void listAutoDetectionMidiPortNames(final AutoDetectionMidiPortNamesList list,
                                                 final PlatformType platformType) {
-        final String[] inputNames = new String[1];
+        // The device exposes two separate MIDI port pairs: "DAW" (port 0 - what everything else in
+        // this class talks to: grid/CC control, Note-On-palette LEDs) and plain "MIDI" (port 1 -
+        // where Drums/Keys/User firmware note-performance data actually arrives; see
+        // hardwareNoteInput). Port name strings taken directly from Bitwig's own bundled
+        // LaunchPadMiniMk3ExtensionDefinition, since this device's exact CoreMIDI/Windows port names
+        // aren't otherwise documented anywhere available here.
+        final String[] inputNames = new String[2];
         final String[] outputNames = new String[1];
 
         switch (platformType) {
             case WINDOWS:
-                // Best-effort: Windows exposes a single combined MIDI interface name for this device.
                 inputNames[0] = "LPMiniMK3 MIDI";
+                inputNames[1] = "MIDIIN2 (LPMiniMK3 MIDI)";
                 outputNames[0] = "LPMiniMK3 MIDI";
                 break;
             case MAC:
             case LINUX:
             default:
                 inputNames[0] = "Launchpad Mini MK3 LPMiniMK3 DAW Out";
+                inputNames[1] = "Launchpad Mini MK3 LPMiniMK3 MIDI Out";
                 outputNames[0] = "Launchpad Mini MK3 LPMiniMK3 DAW In";
                 break;
         }

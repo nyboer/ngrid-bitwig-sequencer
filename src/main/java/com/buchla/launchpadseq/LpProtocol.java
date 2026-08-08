@@ -17,6 +17,12 @@ final class LpProtocol {
 
     static final int CC_OCTAVE_UP = 91;
     static final int CC_OCTAVE_DOWN = 92;
+    static final int CC_LEFT = 93;
+    static final int CC_RIGHT = 94;
+    static final int CC_SESSION = 95;
+    static final int CC_DRUMS = 96;
+    static final int CC_KEYS = 97;
+    static final int CC_USER = 98;
 
     static final int NOTE_STATUS = 0x90;
     static final int CC_STATUS = 0xB0;
