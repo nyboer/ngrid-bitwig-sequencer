@@ -50,7 +50,18 @@ import java.util.Set;
  * it never passes through onMidi in the first place.
  *
  * Grid layout (rows counted from the bottom pad row, as in Novation's numbering):
- *   row 7 (top)    - clip launcher slots for the cursor track (8 clips)
+ *   row 7 (top)    - clip launcher slots for the cursor track (8 clips) - colored like the
+ *                    Session grid (slotLaunchColor): full track/clip color while playing, a
+ *                    dimmed version while stopped-with-content, white while queued, off if empty.
+ *                    The sequencer's edited clip auto-follows whichever slot is actually playing
+ *                    (see the isPlaying observer on slotBank in init), not just manual selection -
+ *                    so a clip launched by mouse, by the Session page, or by a MIDI-mapped trigger
+ *                    all pull the sequencer's view to it the same way. Holding Up (CC91) and
+ *                    tapping a clip pad copies that slot's clip (onClipPadCopy); holding Down
+ *                    (CC92) and tapping a clip pad pastes the last-copied clip into that slot,
+ *                    overwriting whatever's already there (onClipPadPaste) - Up and Down don't
+ *                    need to be held together, so copy, release, then hold Down to paste (possibly
+ *                    into more than one slot) works. Up/Down no longer shift octave - see row 4.
  *   rows 6 and 5   - step toggles, 16 steps total (row 6 = steps 0-7, row 5 = steps 8-15)
  *   row 4          - one-octave keyboard, black keys (also octave shift at columns 0 and 7)
  *   row 3          - one-octave keyboard, white keys
@@ -251,6 +262,14 @@ public class LaunchpadSeqExtension extends ControllerExtension {
     // CC89 (Modifier Column, next to row 7): while held, a step press sets the clip's length to
     // end at that step instead of doing its normal tap/hold/combo thing - see onStepPad.
     private boolean lengthEditHeld = false;
+    // CC91/CC92 (Up/Down): while held, a row-7 clip pad press copies/pastes that slot's clip
+    // instead of its normal select/launch/create-empty behaviour - see onClipPad.
+    private boolean copyHeld = false;
+    private boolean pasteHeld = false;
+    // Column of the row-7 clip pad last copied while copyHeld was held, or -1 if nothing's been
+    // copied yet this session. Persists across releasing Up, so Up and Down don't need to be held
+    // at the same time - copy, let go, then hold Down and paste (possibly repeatedly).
+    private int copiedClipSourceCol = -1;
     // Transport position (in beats) at which the clip's current run started - i.e. the last time
     // it was freshly launched or retriggered, not just looped naturally. Re-synced in the
     // playingStep() observer; see currentRecurrenceCycle for why this needs to exist at all.
@@ -344,7 +363,20 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         for (int i = 0; i < bankSize; i++) {
             final ClipLauncherSlot slot = slotBank.getItemAt(i);
             slot.hasContent().addValueObserver(v -> host.requestFlush());
-            slot.isPlaying().addValueObserver(v -> host.requestFlush());
+            slot.isPlaying().markInterested();
+            // Whatever starts this slot playing - a mouse click in Bitwig, a MIDI-mapped launch, or
+            // our own Session-page grid (see onSessionPad) - selecting it here keeps the sequencer's
+            // cursor clip (which otherwise only follows explicit clip-launcher *selection*, per
+            // createLauncherCursorClip's own javadoc) in sync with whatever's actually playing,
+            // instead of silently continuing to show whatever was last selected by hand.
+            slot.isPlaying().addValueObserver(isPlaying -> {
+                if (isPlaying) {
+                    slot.select();
+                }
+                host.requestFlush();
+            });
+            slot.isPlaybackQueued().markInterested();
+            slot.isPlaybackQueued().addValueObserver(v -> host.requestFlush());
             slot.color().addValueObserver((r, g, b) -> host.requestFlush());
         }
 
@@ -428,14 +460,18 @@ public class LaunchpadSeqExtension extends ControllerExtension {
 
     @Override
     public void flush() {
-        // Explicitly light whichever of the four page buttons is current, on every page - the
-        // device's own autonomous indicator for these four is unreliable (confirmed via hardware
-        // testing: after switching pages, the wrong one could be left lit), so this overrides it
-        // rather than trusting the firmware to track it correctly.
-        sendControlColor(LpProtocol.CC_SESSION, pageButtonColor(Page.SESSION));
-        sendControlColor(LpProtocol.CC_DRUMS, pageButtonColor(Page.DRUMS));
-        sendControlColor(LpProtocol.CC_KEYS, pageButtonColor(Page.KEYS));
-        sendControlColor(LpProtocol.CC_USER, pageButtonColor(Page.USER));
+        // The four page-button LEDs (CC95-98) are NOT included here - confirmed via hardware
+        // testing (with the extension fully disconnected, so no port contention) that they cannot
+        // be driven by CC at all while the device's layout register reads 0 ("Session", set by
+        // reassertGridProtocol/init for the grid's own note-address protocol - see the class doc
+        // comment): sending the exact SysEx this class sends, then CC95-98 directly, produced no
+        // LED change whatsoever. This isn't a timing race (two earlier attempts to win one - a
+        // delayed follow-up repaint, then a repeating heartbeat - both failed for the same
+        // underlying reason and were removed) - the firmware simply doesn't accept writes to these
+        // four while layout 0 is selected, and layout 0 is required for User's own grid to work at
+        // all. In practice this means these four LEDs just always show the device's own built-in
+        // Session indicator, regardless of which page (Session/Drums/Keys/User) is actually active
+        // in software - a known, unfixable-from-here cosmetic limitation, not a bug to keep chasing.
         switch (currentPage) {
             case USER:
                 flushUserPage();
@@ -447,10 +483,6 @@ public class LaunchpadSeqExtension extends ControllerExtension {
             case KEYS:
                 break; // send nothing else - the device's own native firmware coloring shows through
         }
-    }
-
-    private int pageButtonColor(final Page page) {
-        return currentPage == page ? MODE_ACTIVE_COLOR : ColorLookup.OFF;
     }
 
     private void flushUserPage() {
@@ -470,8 +502,8 @@ public class LaunchpadSeqExtension extends ControllerExtension {
             sendColor(LpProtocol.gridNote(ROW_MOD_MID, col), modMidColor(col));
             sendColor(LpProtocol.gridNote(ROW_MOD_BOTTOM, col), modBottomColor(col));
         }
-        sendControlColor(LpProtocol.CC_OCTAVE_UP, CONTROL_IDLE_COLOR);
-        sendControlColor(LpProtocol.CC_OCTAVE_DOWN, CONTROL_IDLE_COLOR);
+        sendControlColor(LpProtocol.CC_OCTAVE_UP, copyHeld ? MODE_ACTIVE_COLOR : CONTROL_IDLE_COLOR);
+        sendControlColor(LpProtocol.CC_OCTAVE_DOWN, pasteHeld ? MODE_ACTIVE_COLOR : CONTROL_IDLE_COLOR);
         sendControlColor(LpProtocol.modifierColumnCC(ROW_MOD_TOP), modeButtonColor(MODE_NOTE_OPS));
         sendControlColor(LpProtocol.modifierColumnCC(ROW_MOD_MID), modeButtonColor(MODE_NOTE_EXPRESSIONS));
         sendControlColor(LpProtocol.modifierColumnCC(ROW_MOD_BOTTOM), modeButtonColor(MODE_RESERVED));
@@ -482,7 +514,10 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         sendControlColor(LpProtocol.modifierColumnCC(ROW_CLIPS), lengthEditHeld ? MODE_ACTIVE_COLOR : ColorLookup.OFF);
     }
 
-    private static final double SESSION_STOPPED_DIM_FACTOR = SUSTAIN_COLOR_DIM_FACTOR; // reuse existing "present but not primary" convention
+    // Shared by the row-7 clip launcher (clipPadColor) and the Session grid (sessionPadColor): a
+    // stopped-but-has-content clip shows a dimmed version of its color so the currently-playing
+    // one (full brightness) stands out, mirroring Bitwig's own Session view convention.
+    private static final double CLIP_STOPPED_DIM_FACTOR = SUSTAIN_COLOR_DIM_FACTOR; // reuse existing "present but not primary" convention
 
     private void renderSessionGrid() {
         for (int row = 0; row < 8; row++) {
@@ -504,7 +539,13 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         if (!sessionTracks[trackIndex].exists().get()) {
             return ColorLookup.OFF;
         }
-        final ClipLauncherSlot slot = sessionSlots[trackIndex][sceneIndex];
+        return slotLaunchColor(sessionSlots[trackIndex][sceneIndex]);
+    }
+
+    /** Playing = full color, queued = white (imminent-trigger, matching STEP_PLAYHEAD_COLOR's
+     * convention elsewhere), stopped-with-content = dimmed color, empty = off. Shared by the
+     * row-7 clip launcher and the Session grid so both read the same at a glance. */
+    private int slotLaunchColor(final ClipLauncherSlot slot) {
         if (!slot.hasContent().get()) {
             return ColorLookup.OFF;
         }
@@ -515,12 +556,12 @@ public class LaunchpadSeqExtension extends ControllerExtension {
             return ColorLookup.nearestPaletteIndex(r, g, b);
         }
         if (slot.isPlaybackQueued().get()) {
-            return ColorLookup.WHITE; // imminent-trigger, matches STEP_PLAYHEAD_COLOR's convention elsewhere
+            return ColorLookup.WHITE;
         }
         return ColorLookup.nearestPaletteIndex(
-            (float) (r * SESSION_STOPPED_DIM_FACTOR),
-            (float) (g * SESSION_STOPPED_DIM_FACTOR),
-            (float) (b * SESSION_STOPPED_DIM_FACTOR));
+            (float) (r * CLIP_STOPPED_DIM_FACTOR),
+            (float) (g * CLIP_STOPPED_DIM_FACTOR),
+            (float) (b * CLIP_STOPPED_DIM_FACTOR));
     }
 
     /** Both view buttons light in auto-follow mode; otherwise only whichever matches the current page. */
@@ -846,11 +887,7 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         if (col >= bankSize) {
             return ColorLookup.OFF;
         }
-        final ClipLauncherSlot slot = slotBank.getItemAt(col);
-        if (!slot.hasContent().get()) {
-            return ColorLookup.OFF;
-        }
-        return ColorLookup.nearestPaletteIndex(slot.color().red(), slot.color().green(), slot.color().blue());
+        return slotLaunchColor(slotBank.getItemAt(col));
     }
 
     private int stepPadColor(final int x) {
@@ -1102,14 +1139,20 @@ public class LaunchpadSeqExtension extends ControllerExtension {
             getHost().requestFlush();
             return;
         }
+        if (cc == LpProtocol.CC_OCTAVE_UP) {
+            copyHeld = isOn;
+            getHost().requestFlush();
+            return;
+        }
+        if (cc == LpProtocol.CC_OCTAVE_DOWN) {
+            pasteHeld = isOn;
+            getHost().requestFlush();
+            return;
+        }
         if (!isOn) {
             return;
         }
-        if (cc == LpProtocol.CC_OCTAVE_UP) {
-            shiftOctave(1);
-        } else if (cc == LpProtocol.CC_OCTAVE_DOWN) {
-            shiftOctave(-1);
-        } else if (cc == LpProtocol.modifierColumnCC(ROW_MOD_TOP)) {
+        if (cc == LpProtocol.modifierColumnCC(ROW_MOD_TOP)) {
             setModifierMode(MODE_NOTE_OPS);
         } else if (cc == LpProtocol.modifierColumnCC(ROW_MOD_MID)) {
             setModifierMode(MODE_NOTE_EXPRESSIONS);
@@ -1137,6 +1180,15 @@ public class LaunchpadSeqExtension extends ControllerExtension {
      * device back out of whatever the firmware did autonomously - a defensive reset rather than a
      * precise undo, since the exact Custom Mode entry/exit SysEx isn't documented anywhere available
      * here.
+     *
+     * Does NOT attempt to also light CC95-98 (the page buttons themselves) - confirmed via hardware
+     * testing that the device simply won't accept writes to those four while its layout register
+     * reads 0 (Session), which this SysEx sets and which User's own grid protocol requires. Two
+     * earlier attempts to make that work (a delayed follow-up repaint, then a repeating heartbeat)
+     * were both treating it as a timing problem and were removed once a controlled test - extension
+     * fully disconnected, this exact SysEx sent manually, then CC95-98 sent directly - showed zero
+     * LED response under any circumstances. See flush()'s own comment for what this means in
+     * practice (the four buttons just always show the device's native Session indicator).
      */
     private void reassertGridProtocol() {
         midiOut.sendSysex(LpProtocol.dawMode(true));
@@ -1230,7 +1282,41 @@ public class LaunchpadSeqExtension extends ControllerExtension {
         getHost().requestFlush();
     }
 
+    /** While CC91 (Up) is held, a press copies that slot's clip (remembered in copiedClipSourceCol)
+     * instead of selecting/launching it; a press on a still-empty slot is ignored, since there's
+     * nothing to copy. Returns true if the press was consumed as a copy, so onClipPad can skip its
+     * normal behaviour entirely for it. */
+    private boolean onClipPadCopy(final int col, final boolean isOn) {
+        if (!copyHeld) {
+            return false;
+        }
+        if (isOn && slotBank.getItemAt(col).hasContent().get()) {
+            copiedClipSourceCol = col;
+            getHost().requestFlush();
+        }
+        return true;
+    }
+
+    /** While CC92 (Down) is held, a press pastes whatever's in copiedClipSourceCol into that slot
+     * (via replaceInsertionPoint().copySlotsOrScenes, which overwrites the slot's existing content
+     * if any) instead of selecting/launching it. Does nothing if nothing's been copied yet. Returns
+     * true if the press was consumed as a paste, so onClipPad can skip its normal behaviour. */
+    private boolean onClipPadPaste(final int col, final boolean isOn) {
+        if (!pasteHeld) {
+            return false;
+        }
+        if (isOn && copiedClipSourceCol >= 0) {
+            final ClipLauncherSlot source = slotBank.getItemAt(copiedClipSourceCol);
+            final ClipLauncherSlot target = slotBank.getItemAt(col);
+            target.replaceInsertionPoint().copySlotsOrScenes(source);
+        }
+        return true;
+    }
+
     private void onClipPad(final int col, final boolean isOn) {
+        if (onClipPadCopy(col, isOn) || onClipPadPaste(col, isOn)) {
+            return;
+        }
         if (isOn) {
             if (heldClipPads.isEmpty() && displayStep < 0) {
                 bulkRecurrenceMask = 0xFF;

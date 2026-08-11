@@ -99,10 +99,25 @@ Three files under `src/main/java/com/buchla/launchpadseq/`:
     left a second consecutive User press dark with notes leaking to `hardwareNoteInput`'s track,
     identical to the original bug, because the device's firmware re-enters Custom Mode on every press
     of the physical button, not just the first.
-  - **The four page buttons' own LEDs are explicitly driven in `flush()`** (`pageButtonColor`),
-    overriding the device's own autonomous indicator rather than trusting it - confirmed via hardware
-    testing that the firmware's own indicator can show the wrong button lit after a page switch,
-    consistent with the pre-existing "don't reliably light" note above.
+  - **The four page buttons' own LEDs (CC95-98) cannot be driven by software at all while the
+    device's layout register is 0 ("Session") - confirmed dead end, don't try again.** They were
+    originally assumed just "unreliable" (the device's own autonomous indicator could show the wrong
+    button lit after a page switch) and, later, the object of a losing *timing* race (a delayed
+    follow-up repaint measurably lit the User LED, confirmed via hardware testing, but Session then
+    visibly replaced it moments later; a `pageButtonHeartbeat` re-fighting that every 250ms forever
+    was tried next). Both were wrong models. The actual, hardware-confirmed cause: with the
+    extension fully disconnected (so no port contention from two senders), sending this class's own
+    startup SysEx (`dawMode(true)` + `selectLayout(0)`) by hand and then CC95-98 directly produced
+    **zero LED change under any circumstances** - not a delayed loss, no response at all. Layout 0
+    is Novation's own name for "Session," and `selectLayout(0)` is required for User's own grid to
+    work at all (see above) - so as long as this class uses layout 0 for anything, these four LEDs
+    are simply firmware-owned and always show the device's native Session indicator, regardless of
+    which page is actually active in software. All the CC-override code for these four
+    (`pageButtonColor`, the per-flush override, `pageButtonHeartbeat`) was removed as confirmed dead
+    weight - `flush()` no longer touches CC95-98 at all. If a future change wants an actual working
+    page indicator, it needs a different LED entirely (e.g. a grid pad or the unused CC99 corner
+    button), not these four - re-attempting CC95-98 control without new evidence a layout other than
+    0 changes this is exactly the kind of guess this note exists to head off.
   - **Drums/Keys note traffic arrives on a second, separate MIDI port**, not the "DAW" port
     (`getMidiInPort(0)`) everything else in this class talks to. Confirmed both by hardware testing
     (no console output at all from a temporary trace on port 0 while pressing Drums/Keys pads, ruling

@@ -42,6 +42,21 @@ has a clip to select and launch it.
 
 **Hold** a clip pad to set Note Operators and Expressions to apply Operator and Expression values to all notes in a clip. 
 
+**Copy and paste clips** with the Up/Down buttons (top row, left of Session): hold **Up** and tap
+a clip pad to copy that clip (nothing happens if the pad is empty); hold **Down** and tap a clip
+pad to paste the last-copied clip into it, replacing whatever's already there. Up and Down don't
+need to be held at the same time - copy, let go, then hold Down whenever you're ready to paste
+(and paste into more than one pad if you like). While either is held, tapping a clip pad only
+copies or pastes - it doesn't also select or launch the clip.
+
+Pads are colored the same way as the Session page's clip grid: the currently playing
+clip lights at full track color, clips with content that aren't playing show a dimmer
+version of that color, an about-to-launch (queued) clip flashes white, and an empty
+slot is unlit. The sequencer always edits whichever clip is actually playing on the
+track, no matter how it was launched - clicking play with the mouse, launching it from
+the Launchpad's Session page, or triggering it over MIDI all pull the step view to that
+clip automatically.
+
 ## Step toggles (rows 6 and 5)
 
 Row 6 and 5 show step toggles for the current page: steps 1-16 or 17-32. 
